@@ -444,3 +444,161 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-production-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for production search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (25)
+                Job,
+                Suffix,
+                Item,
+                ItemDescription,
+                Description,
+                Status,
+                StatusDesc,
+                OrderQty,
+                DueQty,
+                ProducedQty,
+                ItemUM,
+                StartDate,
+                EndDate,
+                DueDate,
+                EstMatlCost,
+                EstLaborCost,
+                EstFixOvhdCost,
+                EstVarOvhdCost,
+                EstOutsideCost,
+                EstBurdenCost,
+                EstTotalCost,
+                ActMatlCost,
+                ActLaborCost,
+                ActFixOvhdCost,
+                ActVarOvhdCost,
+                ActOutsideCost,
+                ActBurdenCost,
+                ActTotalCost,
+                WhseID
+            FROM dbo.ESBProductionOrderView
+            WHERE
+                LTRIM(RTRIM(Job)) LIKE %(search)s
+                OR LTRIM(RTRIM(Item)) LIKE %(search)s
+                OR ItemDescription LIKE %(search)s
+                OR Description LIKE %(search)s
+                OR Status LIKE %(search)s
+                OR StatusDesc LIKE %(search)s
+            ORDER BY
+                CASE WHEN DueDate IS NULL THEN 1 ELSE 0 END,
+                DueDate,
+                Job,
+                Suffix
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        production_orders = [
+            {
+                "job_number": str(row[0]).strip() if row[0] else None,
+                "job_suffix": row[1],
+                "item": str(row[2]).strip() if row[2] else None,
+                "item_description": row[3],
+                "production_description": row[4],
+                "status": row[5],
+                "status_description": row[6],
+                "order_quantity": row[7],
+                "due_quantity": row[8],
+                "produced_quantity": row[9],
+                "unit_of_measure": row[10],
+                "start_date": row[11],
+                "end_date": row[12],
+                "due_date": row[13],
+                "estimated_material_cost": row[14],
+                "estimated_labor_cost": row[15],
+                "estimated_fixed_overhead": row[16],
+                "estimated_variable_overhead": row[17],
+                "estimated_outside_cost": row[18],
+                "estimated_burden_cost": row[19],
+                "estimated_total_cost": row[20],
+                "actual_material_cost": row[21],
+                "actual_labor_cost": row[22],
+                "actual_fixed_overhead": row[23],
+                "actual_variable_overhead": row[24],
+                "actual_outside_cost": row[25],
+                "actual_burden_cost": row[26],
+                "actual_total_cost": row[27],
+                "warehouse": row[28]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "view": "dbo.ESBProductionOrderView",
+            "search_term": search,
+            "returned_rows": len(production_orders),
+            "production_orders": production_orders
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
