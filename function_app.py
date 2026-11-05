@@ -602,3 +602,124 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-invoice-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for invoice search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (25)
+                InvNum,
+                InvDate,
+                ArtDescription,
+                CustNum,
+                Name,
+                CoNum,
+                CustPo,
+                ArtDueDate,
+                TotalAmount,
+                ExtendedAmount,
+                TaxAmount,
+                DerStatus,
+                BillingISOCurrCode
+            FROM dbo.ESBInvoiceHeaderView
+            WHERE
+                LTRIM(RTRIM(InvNum)) LIKE %(search)s
+                OR LTRIM(RTRIM(CustNum)) LIKE %(search)s
+                OR Name LIKE %(search)s
+                OR LTRIM(RTRIM(CoNum)) LIKE %(search)s
+                OR CustPo LIKE %(search)s
+            ORDER BY InvDate DESC, InvNum
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        invoices = [
+            {
+                "invoice_number": str(row[0]).strip() if row[0] else None,
+                "invoice_date": row[1],
+                "invoice_description": row[2],
+                "customer_number": str(row[3]).strip() if row[3] else None,
+                "customer_name": row[4],
+                "sales_order": str(row[5]).strip() if row[5] else None,
+                "customer_po": row[6],
+                "due_date": row[7],
+                "total_amount": row[8],
+                "extended_amount": row[9],
+                "tax_amount": row[10],
+                "status": row[11],
+                "currency": row[12]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "view": "dbo.ESBInvoiceHeaderView",
+            "search_term": search,
+            "returned_rows": len(invoices),
+            "invoices": invoices
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
