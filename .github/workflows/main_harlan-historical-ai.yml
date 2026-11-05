@@ -79,7 +79,7 @@ jobs:
         uses: Azure/functions-action@v1
         id: deploy-to-function
         with:
-          app-name: 'Harlan-Historical-AI'
-          slot-name: 'Production'
+          app-name: 'harlan-historical-ai'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          remote-build: true
           
