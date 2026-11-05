@@ -36,19 +36,19 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
         cursor = conn.cursor()
 
         cursor.execute("""
-    SELECT TOP (25)
-        TABLE_SCHEMA,
-        TABLE_NAME
-    FROM INFORMATION_SCHEMA.VIEWS
-    ORDER BY TABLE_SCHEMA, TABLE_NAME
-""")
+            SELECT TOP (25)
+                TABLE_SCHEMA,
+                TABLE_NAME
+            FROM INFORMATION_SCHEMA.VIEWS
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+        """)
 
-rows = cursor.fetchall()
+        rows = cursor.fetchall()
 
-result["accessible_views"] = [
-    {"schema": row[0], "view": row[1]}
-    for row in rows
-]
+        result["accessible_views"] = [
+            {"schema": row[0], "view": row[1]}
+            for row in rows
+        ]
 
         row = cursor.fetchone()
 
