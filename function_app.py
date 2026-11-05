@@ -327,3 +327,120 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-inventory-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for inventory search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (25)
+                item,
+                description,
+                u_m,
+                lead_time,
+                qty_on_hand,
+                Dealer,
+                Distributor,
+                Competitive,
+                CLK_List,
+                CLK_Net,
+                OEM
+            FROM dbo.AA_HGitems
+            WHERE
+                item IS NOT NULL
+                AND (
+                    LTRIM(RTRIM(item)) LIKE %(search)s
+                    OR description LIKE %(search)s
+                )
+            ORDER BY item
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        inventory = [
+            {
+                "item": str(row[0]).strip() if row[0] else None,
+                "description": row[1],
+                "unit_of_measure": row[2],
+                "lead_time": row[3],
+                "quantity_on_hand": row[4],
+                "dealer_price": row[5],
+                "distributor_price": row[6],
+                "competitive_price": row[7],
+                "list_price": row[8],
+                "net_price": row[9],
+                "oem_price": row[10]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "view": "dbo.AA_HGitems",
+            "search_term": search,
+            "returned_rows": len(inventory),
+            "inventory": inventory
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
