@@ -30,7 +30,6 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
             "Authentication=ActiveDirectoryMSI;"
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
-            "ConnectionTimeout=15;"
         )
 
         conn = mssql_python.connect(connection_string)
