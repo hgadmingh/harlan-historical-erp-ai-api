@@ -102,3 +102,91 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
         mimetype="application/json",
         status_code=200
     )
+
+@app.route(
+    route="erp-customer-sample",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_customer_sample(req: func.HttpRequest) -> func.HttpResponse:
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (5)
+                CustNum,
+                CustSeq,
+                Name,
+                City,
+                State,
+                Territory,
+                CustomerType,
+                CustomerTypeDescription,
+                CustomerAccountStatusID,
+                CustomerAccountStatusDescription
+            FROM dbo.ESBCustomerView
+            ORDER BY Name, CustNum
+        """)
+
+        rows = cursor.fetchall()
+
+        customers = [
+            {
+                "customer_number": row[0],
+                "customer_sequence": row[1],
+                "name": row[2],
+                "city": row[3],
+                "state": row[4],
+                "territory": row[5],
+                "customer_type": row[6],
+                "customer_type_description": row[7],
+                "account_status_id": row[8],
+                "account_status": row[9]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "view": "dbo.ESBCustomerView",
+            "returned_rows": len(customers),
+            "customers": customers
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
