@@ -723,3 +723,115 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-ar-aging-summary",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                COUNT(DISTINCT cust_num) AS CustomerCount,
+                COUNT(*) AS TransactionRows,
+
+                COALESCE(SUM(AgeBal1), 0) AS AgeBal1,
+                COALESCE(SUM(AgeBal2), 0) AS AgeBal2,
+                COALESCE(SUM(AgeBal3), 0) AS AgeBal3,
+                COALESCE(SUM(AgeBal4), 0) AS AgeBal4,
+                COALESCE(SUM(AgeBal5), 0) AS AgeBal5,
+
+                COALESCE(SUM(AgeBal6), 0) AS TotalARBalance,
+
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN AgingDays IS NULL
+                                THEN AgeBal6
+                            ELSE 0
+                        END
+                    ), 0
+                ) AS UnbucketedBalance,
+
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN AgingDays IS NULL
+                                THEN 1
+                            ELSE 0
+                        END
+                    ), 0
+                ) AS RowsWithNoAgeDate
+
+            FROM dbo.AI_HistoricalARAgingView
+        """)
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise Exception("The AR aging summary query returned no results.")
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Accounts Receivable Aging",
+            "as_of_date": "2025-12-31",
+            "data_status": "Historical static snapshot",
+            "view": "dbo.AI_HistoricalARAgingView",
+
+            "customer_count": row[0],
+            "transaction_rows": row[1],
+
+            "aging_buckets": {
+                "current": row[2],
+                "1_to_30_days": row[3],
+                "31_to_60_days": row[4],
+                "61_to_90_days": row[5],
+                "over_90_days": row[6]
+            },
+
+            "total_ar_balance": row[7],
+            "unbucketed_balance": row[8],
+            "rows_with_no_age_date": row[9]
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Accounts Receivable Aging",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
