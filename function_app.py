@@ -104,11 +104,29 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 @app.route(
-    route="erp-customer-sample",
+    route="erp-customer-search",
     methods=["GET"],
     auth_level=func.AuthLevel.FUNCTION
 )
-def erp_customer_sample(req: func.HttpRequest) -> func.HttpResponse:
+def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for customer search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
+            mimetype="application/json",
+            status_code=400
+        )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
@@ -129,7 +147,7 @@ def erp_customer_sample(req: func.HttpRequest) -> func.HttpResponse:
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT TOP (5)
+            SELECT TOP (25)
                 CustNum,
                 CustSeq,
                 Name,
@@ -141,14 +159,20 @@ def erp_customer_sample(req: func.HttpRequest) -> func.HttpResponse:
                 CustomerAccountStatusID,
                 CustomerAccountStatusDescription
             FROM dbo.ESBCustomerView
-            ORDER BY Name, CustNum
-        """)
+            WHERE Name IS NOT NULL
+              AND LTRIM(RTRIM(Name)) <> ''
+              AND (
+                  LTRIM(RTRIM(CustNum)) LIKE %(search)s
+                  OR Name LIKE %(search)s
+              )
+            ORDER BY Name, CustNum, CustSeq
+        """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
 
         customers = [
             {
-                "customer_number": row[0],
+                "customer_number": str(row[0]).strip() if row[0] else None,
                 "customer_sequence": row[1],
                 "name": row[2],
                 "city": row[3],
@@ -165,6 +189,7 @@ def erp_customer_sample(req: func.HttpRequest) -> func.HttpResponse:
         result = {
             "connection": "Success",
             "view": "dbo.ESBCustomerView",
+            "search_term": search,
             "returned_rows": len(customers),
             "customers": customers
         }
