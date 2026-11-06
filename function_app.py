@@ -1006,3 +1006,132 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-ar-top-customers",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (10)
+
+                a.site_ref,
+                a.customer_number,
+                n.CustomerName,
+
+                a.transaction_rows,
+
+                a.current_balance,
+                a.balance_1_to_30,
+                a.balance_31_to_60,
+                a.balance_61_to_90,
+                a.balance_over_90,
+
+                a.total_ar_balance
+
+            FROM dbo.AI_HistoricalARCustomerSummary a
+
+            OUTER APPLY
+            (
+                SELECT TOP (1)
+                    LTRIM(RTRIM(c.Name)) AS CustomerName
+
+                FROM dbo.ESBCustomerView c
+
+                WHERE LTRIM(RTRIM(c.CustNum)) =
+                      a.customer_number
+
+                  AND c.Name IS NOT NULL
+                  AND LTRIM(RTRIM(c.Name)) <> ''
+
+                ORDER BY
+                    CASE
+                        WHEN c.CustSeq = 0 THEN 0
+                        ELSE 1
+                    END,
+                    c.CustSeq
+
+            ) n
+
+            WHERE a.total_ar_balance > 0
+
+            ORDER BY
+                a.total_ar_balance DESC,
+                a.customer_number
+        """)
+
+        rows = cursor.fetchall()
+
+        customers = [
+            {
+                "rank": index + 1,
+                "site": row[0],
+                "customer_number": str(row[1]).strip() if row[1] else None,
+                "customer_name": row[2],
+                "transaction_rows": row[3],
+
+                "aging_buckets": {
+                    "current": row[4],
+                    "1_to_30_days": row[5],
+                    "31_to_60_days": row[6],
+                    "61_to_90_days": row[7],
+                    "over_90_days": row[8]
+                },
+
+                "total_ar_balance": row[9]
+            }
+            for index, row in enumerate(rows)
+        ]
+
+        result = {
+            "connection": "Success",
+            "report": "Top 10 Historical Accounts Receivable Customers",
+            "as_of_date": "2025-12-31",
+            "data_status": "Historical static snapshot",
+            "summary_table": "dbo.AI_HistoricalARCustomerSummary",
+            "returned_rows": len(customers),
+            "customers": customers
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Top 10 Historical Accounts Receivable Customers",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
