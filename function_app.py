@@ -1,18 +1,138 @@
 import azure.functions as func
-import socket
+import base64
 import json
-import os
 import mssql_python
+from functools import wraps
+
+
+# =========================================================
+# HISTORICAL ERP API AUTHORIZATION
+# Azure App Service Authentication (Easy Auth) must be
+# configured to require authentication before requests reach
+# this Function App. Easy Auth validates the incoming token and
+# supplies X-MS-CLIENT-PRINCIPAL to this code.
+# =========================================================
+
+REQUIRED_API_SCOPE = "historicalerp.read"
+REQUIRED_API_ROLE = "HistoricalERP.Access"
+
+
+def authorize_erp_request(req: func.HttpRequest):
+    encoded_principal = req.headers.get("X-MS-CLIENT-PRINCIPAL")
+
+    if not encoded_principal:
+        return func.HttpResponse(
+            json.dumps({"error": "Authentication required."}),
+            mimetype="application/json",
+            status_code=401
+        )
+
+    try:
+        padding = "=" * (-len(encoded_principal) % 4)
+        principal_json = base64.b64decode(
+            encoded_principal + padding,
+            validate=True
+        ).decode("utf-8")
+        principal = json.loads(principal_json)
+
+        # This API is intended to accept Microsoft Entra identities only.
+        if str(principal.get("auth_typ", "")).lower() != "aad":
+            return func.HttpResponse(
+                json.dumps({"error": "A Microsoft Entra identity is required."}),
+                mimetype="application/json",
+                status_code=401
+            )
+
+        claims = principal.get("claims", [])
+        if not isinstance(claims, list):
+            raise ValueError("Invalid claims collection")
+
+        role_claim_type = str(principal.get("role_typ", "roles")).lower()
+        scopes = set()
+        roles = set()
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+
+            claim_type = str(claim.get("typ", "")).lower()
+            claim_value = str(claim.get("val", "")).strip()
+
+            if not claim_value:
+                continue
+
+            # Easy Auth may map the delegated scope claim to either
+            # 'scp'/'scope' or the Microsoft claims URI ending in '/scope'.
+            if (
+                claim_type in ("scp", "scope")
+                or claim_type.endswith("/scope")
+            ):
+                scopes.update(claim_value.split())
+
+            # Use Easy Auth's role_typ when present, and support the
+            # standard role/roles claim names and Microsoft role URI.
+            if (
+                claim_type == role_claim_type
+                or claim_type in ("role", "roles")
+                or claim_type.endswith("/role")
+            ):
+                roles.add(claim_value)
+
+    except Exception:
+        return func.HttpResponse(
+            json.dumps({"error": "Unable to read the authenticated identity claims."}),
+            mimetype="application/json",
+            status_code=401
+        )
+
+    if REQUIRED_API_SCOPE not in scopes:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "You do not have the required API permission.",
+                "required_scope": REQUIRED_API_SCOPE
+            }),
+            mimetype="application/json",
+            status_code=403
+        )
+
+    if REQUIRED_API_ROLE not in roles:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "You are not authorized to access Harlan historical ERP data.",
+                "required_role": REQUIRED_API_ROLE
+            }),
+            mimetype="application/json",
+            status_code=403
+        )
+
+    return None
+
+
+def require_erp_access(handler):
+    @wraps(handler)
+    def wrapped(req: func.HttpRequest) -> func.HttpResponse:
+        auth_response = authorize_erp_request(req)
+        if auth_response is not None:
+            return auth_response
+        return handler(req)
+
+    return wrapped
+
 
 app = func.FunctionApp()
+
+
+# =========================================================
+# 1. SQL CONNECTION TEST
+# =========================================================
 
 @app.route(
     route="sql-connection-test",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
-
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
 
@@ -38,17 +158,11 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
 
         conn = mssql_python.connect(connection_string)
         result["connection"] = "Success"
-
         cursor = conn.cursor()
 
-        # Verify the authenticated database identity
         cursor.execute("""
-            SELECT
-                DB_NAME(),
-                USER_NAME(),
-                ORIGINAL_LOGIN()
+            SELECT DB_NAME(), USER_NAME(), ORIGINAL_LOGIN()
         """)
-
         identity = cursor.fetchone()
 
         if identity:
@@ -56,31 +170,23 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
             result["database_user"] = identity[1]
             result["original_login"] = identity[2]
 
-        # Count views visible to this identity
         cursor.execute("""
             SELECT COUNT(*)
             FROM INFORMATION_SCHEMA.VIEWS
         """)
-
         count_row = cursor.fetchone()
         result["accessible_view_count"] = count_row[0]
 
-        # Return the first 25 accessible views
         cursor.execute("""
-            SELECT TOP (25)
-                TABLE_SCHEMA,
-                TABLE_NAME
+            SELECT TOP (25) TABLE_SCHEMA, TABLE_NAME
             FROM INFORMATION_SCHEMA.VIEWS
             ORDER BY TABLE_SCHEMA, TABLE_NAME
         """)
-
         rows = cursor.fetchall()
-
         result["accessible_views"] = [
             {"schema": row[0], "view": row[1]}
             for row in rows
         ]
-
         result["view_query"] = "Success"
 
     except Exception as e:
@@ -88,7 +194,6 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
             result["view_query"] = "Failed"
         else:
             result["connection"] = "Failed"
-
         result["error"] = str(e)
 
     finally:
@@ -103,24 +208,26 @@ def sql_connection_test(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
+
+# =========================================================
+# 2. CUSTOMER SEARCH
+# =========================================================
+
 @app.route(
     route="erp-customer-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for customer search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for customer search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
             json.dumps({"error": "Search term cannot exceed 100 characters."}),
@@ -130,7 +237,6 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -142,22 +248,14 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (25)
-                CustNum,
-                CustSeq,
-                Name,
-                City,
-                State,
-                Territory,
-                CustomerType,
-                CustomerTypeDescription,
-                CustomerAccountStatusID,
-                CustomerAccountStatusDescription
+                CustNum, CustSeq, Name, City, State, Territory,
+                CustomerType, CustomerTypeDescription,
+                CustomerAccountStatusID, CustomerAccountStatusDescription
             FROM dbo.ESBCustomerView
             WHERE Name IS NOT NULL
               AND LTRIM(RTRIM(Name)) <> ''
@@ -169,7 +267,6 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         customers = [
             {
                 "customer_number": str(row[0]).strip() if row[0] else None,
@@ -193,7 +290,6 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(customers),
             "customers": customers
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -202,10 +298,7 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": str(e)
-            }),
+            json.dumps({"connection": "Failed", "error": str(e)}),
             mimetype="application/json",
             status_code=500
         )
@@ -216,36 +309,35 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 3. SALES ORDER SEARCH
+# =========================================================
+
 @app.route(
     route="erp-sales-order-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters."
-            }),
+            json.dumps({"error": "Please provide at least two characters."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -257,21 +349,13 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (25)
-                CoNum,
-                OrderDate,
-                DerStat,
-                DerStatDescription,
-                CustomerID,
-                CustomerName,
-                CustPo,
-                DerExtAmt,
-                Whse
+                CoNum, OrderDate, DerStat, DerStatDescription,
+                CustomerID, CustomerName, CustPo, DerExtAmt, Whse
             FROM dbo.ESBSalesOrderView
             WHERE
                 LTRIM(RTRIM(CoNum)) LIKE %(search)s
@@ -282,7 +366,6 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         orders = [
             {
                 "sales_order": str(row[0]).strip() if row[0] else None,
@@ -305,7 +388,6 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(orders),
             "sales_orders": orders
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -314,10 +396,7 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": str(e)
-            }),
+            json.dumps({"connection": "Failed", "error": str(e)}),
             mimetype="application/json",
             status_code=500
         )
@@ -328,36 +407,35 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 4. INVENTORY SEARCH (INCLUDES PRICING)
+# =========================================================
+
 @app.route(
     route="erp-inventory-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for inventory search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for inventory search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -369,23 +447,13 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (25)
-                item,
-                description,
-                u_m,
-                lead_time,
-                qty_on_hand,
-                Dealer,
-                Distributor,
-                Competitive,
-                CLK_List,
-                CLK_Net,
-                OEM
+                item, description, u_m, lead_time, qty_on_hand,
+                Dealer, Distributor, Competitive, CLK_List, CLK_Net, OEM
             FROM dbo.AA_HGitems
             WHERE
                 item IS NOT NULL
@@ -397,7 +465,6 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         inventory = [
             {
                 "item": str(row[0]).strip() if row[0] else None,
@@ -422,7 +489,6 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(inventory),
             "inventory": inventory
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -431,10 +497,7 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": str(e)
-            }),
+            json.dumps({"connection": "Failed", "error": str(e)}),
             mimetype="application/json",
             status_code=500
         )
@@ -445,36 +508,35 @@ def erp_inventory_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 5. PRODUCTION ORDER SEARCH
+# =========================================================
+
 @app.route(
     route="erp-production-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for production search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for production search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -486,41 +548,19 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (25)
-                Job,
-                Suffix,
-                Item,
-                ItemDescription,
-                Description,
-                Status,
-                StatusDesc,
-                OrderQty,
-                DueQty,
-                ProducedQty,
-                ItemUM,
-                StartDate,
-                EndDate,
-                DueDate,
-                EstMatlCost,
-                EstLaborCost,
-                EstFixOvhdCost,
-                EstVarOvhdCost,
-                EstOutsideCost,
-                EstBurdenCost,
-                EstTotalCost,
-                ActMatlCost,
-                ActLaborCost,
-                ActFixOvhdCost,
-                ActVarOvhdCost,
-                ActOutsideCost,
-                ActBurdenCost,
-                ActTotalCost,
-                WhseID
+                Job, Suffix, Item, ItemDescription, Description,
+                Status, StatusDesc, OrderQty, DueQty, ProducedQty,
+                ItemUM, StartDate, EndDate, DueDate,
+                EstMatlCost, EstLaborCost, EstFixOvhdCost,
+                EstVarOvhdCost, EstOutsideCost, EstBurdenCost,
+                EstTotalCost, ActMatlCost, ActLaborCost,
+                ActFixOvhdCost, ActVarOvhdCost, ActOutsideCost,
+                ActBurdenCost, ActTotalCost, WhseID
             FROM dbo.ESBProductionOrderView
             WHERE
                 LTRIM(RTRIM(Job)) LIKE %(search)s
@@ -531,13 +571,10 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
                 OR StatusDesc LIKE %(search)s
             ORDER BY
                 CASE WHEN DueDate IS NULL THEN 1 ELSE 0 END,
-                DueDate,
-                Job,
-                Suffix
+                DueDate, Job, Suffix
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         production_orders = [
             {
                 "job_number": str(row[0]).strip() if row[0] else None,
@@ -580,7 +617,6 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(production_orders),
             "production_orders": production_orders
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -589,10 +625,7 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": str(e)
-            }),
+            json.dumps({"connection": "Failed", "error": str(e)}),
             mimetype="application/json",
             status_code=500
         )
@@ -603,36 +636,35 @@ def erp_production_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 6. INVOICE SEARCH
+# =========================================================
+
 @app.route(
     route="erp-invoice-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for invoice search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for invoice search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -644,24 +676,14 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (25)
-                InvNum,
-                InvDate,
-                ArtDescription,
-                CustNum,
-                Name,
-                CoNum,
-                CustPo,
-                ArtDueDate,
-                TotalAmount,
-                ExtendedAmount,
-                TaxAmount,
-                DerStatus,
+                InvNum, InvDate, ArtDescription, CustNum, Name,
+                CoNum, CustPo, ArtDueDate, TotalAmount,
+                ExtendedAmount, TaxAmount, DerStatus,
                 BillingISOCurrCode
             FROM dbo.ESBInvoiceHeaderView
             WHERE
@@ -674,7 +696,6 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         invoices = [
             {
                 "invoice_number": str(row[0]).strip() if row[0] else None,
@@ -701,7 +722,6 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(invoices),
             "invoices": invoices
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -710,10 +730,7 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as e:
         return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": str(e)
-            }),
+            json.dumps({"connection": "Failed", "error": str(e)}),
             mimetype="application/json",
             status_code=500
         )
@@ -724,16 +741,20 @@ def erp_invoice_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 7. TOP 10 HISTORICAL AR CUSTOMERS
+# =========================================================
+
 @app.route(
     route="erp-ar-top-customers",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
-
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -745,60 +766,39 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (10)
-
                 a.site_ref,
                 a.customer_number,
                 n.CustomerName,
-
                 a.transaction_rows,
-
                 a.current_balance,
                 a.balance_1_to_30,
                 a.balance_31_to_60,
                 a.balance_61_to_90,
                 a.balance_over_90,
-
                 a.total_ar_balance
-
             FROM dbo.AI_HistoricalARCustomerSummary a
-
             OUTER APPLY
             (
                 SELECT TOP (1)
                     LTRIM(RTRIM(c.Name)) AS CustomerName
-
                 FROM dbo.ESBCustomerView c
-
-                WHERE LTRIM(RTRIM(c.CustNum)) =
-                      a.customer_number
-
+                WHERE LTRIM(RTRIM(c.CustNum)) = a.customer_number
                   AND c.Name IS NOT NULL
                   AND LTRIM(RTRIM(c.Name)) <> ''
-
                 ORDER BY
-                    CASE
-                        WHEN c.CustSeq = 0 THEN 0
-                        ELSE 1
-                    END,
+                    CASE WHEN c.CustSeq = 0 THEN 0 ELSE 1 END,
                     c.CustSeq
-
             ) n
-
             WHERE a.total_ar_balance > 0
-
-            ORDER BY
-                a.total_ar_balance DESC,
-                a.customer_number
+            ORDER BY a.total_ar_balance DESC, a.customer_number
         """)
 
         rows = cursor.fetchall()
-
         customers = [
             {
                 "rank": index + 1,
@@ -806,7 +806,6 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
                 "customer_number": str(row[1]).strip() if row[1] else None,
                 "customer_name": row[2],
                 "transaction_rows": row[3],
-
                 "aging_buckets": {
                     "current": row[4],
                     "1_to_30_days": row[5],
@@ -814,7 +813,6 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
                     "61_to_90_days": row[7],
                     "over_90_days": row[8]
                 },
-
                 "total_ar_balance": row[9]
             }
             for index, row in enumerate(rows)
@@ -829,7 +827,6 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
             "returned_rows": len(customers),
             "customers": customers
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -853,36 +850,35 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 8. HISTORICAL AR CUSTOMER AGING SEARCH
+# =========================================================
+
 @app.route(
     route="erp-ar-customer-aging",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for customer search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for customer search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -894,7 +890,6 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
@@ -904,7 +899,6 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
                 SELECT
                     LTRIM(RTRIM(c.CustNum)) AS CustomerNumber,
                     LTRIM(RTRIM(c.Name)) AS CustomerName,
-
                     ROW_NUMBER() OVER
                     (
                         PARTITION BY LTRIM(RTRIM(c.CustNum))
@@ -912,9 +906,7 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
                             CASE WHEN c.CustSeq = 0 THEN 0 ELSE 1 END,
                             c.CustSeq
                     ) AS RowNum
-
                 FROM dbo.ESBCustomerView c
-
                 WHERE
                     c.Name IS NOT NULL
                     AND LTRIM(RTRIM(c.Name)) <> ''
@@ -924,52 +916,36 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
                         OR LTRIM(RTRIM(c.CustNum)) LIKE %(search)s
                     )
             ),
-
             SelectedCustomers AS
             (
-                SELECT
-                    CustomerNumber,
-                    CustomerName
+                SELECT CustomerNumber, CustomerName
                 FROM MatchingCustomers
                 WHERE RowNum = 1
             )
-
             SELECT TOP (25)
-
                 a.site_ref,
                 a.customer_number,
                 c.CustomerName,
-
                 a.transaction_rows,
-
                 a.current_balance,
                 a.balance_1_to_30,
                 a.balance_31_to_60,
                 a.balance_61_to_90,
                 a.balance_over_90,
-
                 a.total_ar_balance
-
             FROM dbo.AI_HistoricalARCustomerSummary a
-
             INNER JOIN SelectedCustomers c
                 ON a.customer_number = c.CustomerNumber
-
-            ORDER BY
-                a.total_ar_balance DESC,
-                a.customer_number
-
+            ORDER BY a.total_ar_balance DESC, a.customer_number
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         customers = [
             {
                 "site": row[0],
                 "customer_number": str(row[1]).strip() if row[1] else None,
                 "customer_name": row[2],
                 "transaction_rows": row[3],
-
                 "aging_buckets": {
                     "current": row[4],
                     "1_to_30_days": row[5],
@@ -977,7 +953,6 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
                     "61_to_90_days": row[7],
                     "over_90_days": row[8]
                 },
-
                 "total_ar_balance": row[9]
             }
             for row in rows
@@ -994,7 +969,6 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
             "maximum_rows": 25,
             "customers": customers
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -1018,16 +992,20 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+# =========================================================
+# 9. HISTORICAL AR AGING SUMMARY
+# =========================================================
+
 @app.route(
     route="erp-ar-aging-summary",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
-
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -1039,40 +1017,23 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT
                 COUNT(*) AS CustomerCount,
-
-                COALESCE(SUM(transaction_rows), 0)
-                    AS TransactionRows,
-
-                COALESCE(SUM(current_balance), 0)
-                    AS AgeBal1,
-
-                COALESCE(SUM(balance_1_to_30), 0)
-                    AS AgeBal2,
-
-                COALESCE(SUM(balance_31_to_60), 0)
-                    AS AgeBal3,
-
-                COALESCE(SUM(balance_61_to_90), 0)
-                    AS AgeBal4,
-
-                COALESCE(SUM(balance_over_90), 0)
-                    AS AgeBal5,
-
-                COALESCE(SUM(total_ar_balance), 0)
-                    AS TotalARBalance
-
+                COALESCE(SUM(transaction_rows), 0) AS TransactionRows,
+                COALESCE(SUM(current_balance), 0) AS AgeBal1,
+                COALESCE(SUM(balance_1_to_30), 0) AS AgeBal2,
+                COALESCE(SUM(balance_31_to_60), 0) AS AgeBal3,
+                COALESCE(SUM(balance_61_to_90), 0) AS AgeBal4,
+                COALESCE(SUM(balance_over_90), 0) AS AgeBal5,
+                COALESCE(SUM(total_ar_balance), 0) AS TotalARBalance
             FROM dbo.AI_HistoricalARCustomerSummary
         """)
 
         row = cursor.fetchone()
-
         if not row:
             raise Exception("The AR summary query returned no results.")
 
@@ -1082,10 +1043,8 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
             "as_of_date": "2025-12-31",
             "data_status": "Historical static snapshot",
             "summary_table": "dbo.AI_HistoricalARCustomerSummary",
-
             "customer_count": row[0],
             "transaction_rows": row[1],
-
             "aging_buckets": {
                 "current": row[2],
                 "1_to_30_days": row[3],
@@ -1093,15 +1052,10 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
                 "61_to_90_days": row[5],
                 "over_90_days": row[6]
             },
-
             "total_ar_balance": row[7],
-
-            # These were validated as zero when the summary
-            # table was created from the historical aging view.
             "unbucketed_balance": 0,
             "rows_with_no_age_date": 0
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -1126,24 +1080,25 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 
+# =========================================================
+# 10. PURCHASE ORDER SEARCH
+# =========================================================
+
 @app.route(
     route="erp-purchase-order-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for purchase order search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for purchase order search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
             json.dumps({"error": "Search term cannot exceed 100 characters."}),
@@ -1153,7 +1108,6 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -1165,43 +1119,34 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (50)
-
                 PurchaseOrderType,
                 PoNum,
                 PoLine,
                 DerStat,
-
                 DerItem,
                 DerItemDescription,
-
                 DerQuantity,
                 QtyReceivedConv,
                 DerOpenQuantity,
-
                 CASE
                     WHEN PurchaseOrderType = 'R'
                      AND QtyReceivedConv IS NOT NULL
                     THEN DerQuantity - QtyReceivedConv
                     ELSE NULL
                 END AS CalculatedRemainingQuantity,
-
                 DerQuantityUnitCode,
                 DerUnitCostConv,
                 DerExtendedAmountConv,
                 DerTotalAmountConv,
                 CurrISOCurrCode,
-
                 ItemRequiredDeliveryDateTime,
-
                 ReqNum,
                 ReqLine,
-
                 DerShipToLocation,
                 DerShipToName,
                 DerShipToAddr1,
@@ -1214,60 +1159,44 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
                 DerShipToZip,
                 DerShipToContactName,
                 DerShipToPhone,
-
                 Incoterm,
-
                 ProductionOrderRefID,
                 ProductionOrderRevID,
                 ProductionOrderDesc,
                 ProductionOrderStat
-
             FROM dbo.AI_PurchaseOrderLineSearchView
-
             WHERE
                 LTRIM(RTRIM(PoNum)) LIKE %(search)s
                 OR LTRIM(RTRIM(DerItem)) LIKE %(search)s
                 OR DerItemDescription LIKE %(search)s
-
             ORDER BY
-                CASE
-                    WHEN ItemRequiredDeliveryDateTime IS NULL
-                    THEN 1 ELSE 0
-                END,
+                CASE WHEN ItemRequiredDeliveryDateTime IS NULL THEN 1 ELSE 0 END,
                 ItemRequiredDeliveryDateTime,
                 PoNum,
                 PoLine
-
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         purchase_orders = [
             {
                 "purchase_order_type": row[0],
                 "purchase_order_number": str(row[1]).strip() if row[1] else None,
                 "po_line": row[2],
                 "status": row[3],
-
                 "item_number": str(row[4]).strip() if row[4] else None,
                 "item_description": row[5],
-
                 "quantity_ordered": row[6],
                 "quantity_received": row[7],
                 "syteLine_open_quantity": row[8],
                 "calculated_remaining_quantity": row[9],
-
                 "unit_of_measure": row[10],
                 "unit_cost": row[11],
                 "extended_amount": row[12],
                 "total_amount": row[13],
                 "currency": row[14],
-
                 "required_delivery_date": row[15],
-
                 "requisition_number": row[16],
                 "requisition_line": row[17],
-
                 "ship_to": {
                     "location_type": row[18],
                     "name": row[19],
@@ -1282,9 +1211,7 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
                     "contact": row[28],
                     "phone": row[29]
                 },
-
                 "incoterm": row[30],
-
                 "production_order": {
                     "reference": row[31],
                     "revision": row[32],
@@ -1305,7 +1232,6 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "maximum_rows": 50,
             "purchase_orders": purchase_orders
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
@@ -1330,36 +1256,34 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 
+# =========================================================
+# 11. SHIPPING AND TRACKING SEARCH
+# =========================================================
+
 @app.route(
     route="erp-shipping-search",
     methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
+    auth_level=func.AuthLevel.ANONYMOUS
 )
+@require_erp_access
 def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
-
     search = (req.params.get("search") or "").strip()
 
     if len(search) < 2:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for shipping search."
-            }),
+            json.dumps({"error": "Please provide at least two characters for shipping search."}),
             mimetype="application/json",
             status_code=400
         )
-
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
 
     server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
     database = "HARLAN_APP_0709"
-
     conn = None
     cursor = None
 
@@ -1371,20 +1295,16 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
-
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
         cursor.execute("""
             SELECT TOP (50)
-
                 CoNum_and_CoLine,
                 co_Num,
                 Co_Line,
                 cust_po,
-
                 UfcoOrderTrack,
-
                 name,
                 add1,
                 add2,
@@ -1395,42 +1315,27 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
                 zip,
                 county,
                 country,
-
                 phone2,
                 ship_to_email,
-
                 Uf_coDeliveryService,
                 Uf_coDeliveryTerm
-
             FROM dbo.AA_ShippingView
-
             WHERE
                 LTRIM(RTRIM(co_Num)) LIKE %(search)s
-
-                OR LTRIM(RTRIM(CoNum_and_CoLine))
-                    LIKE %(search)s
-
+                OR LTRIM(RTRIM(CoNum_and_CoLine)) LIKE %(search)s
                 OR LTRIM(RTRIM(cust_po)) LIKE %(search)s
-
                 OR UfcoOrderTrack LIKE %(search)s
-
-            ORDER BY
-                co_Num DESC,
-                Co_Line
-
+            ORDER BY co_Num DESC, Co_Line
         """, {"search": f"%{search}%"})
 
         rows = cursor.fetchall()
-
         shipments = [
             {
                 "sales_order_line_key": row[0],
                 "sales_order": str(row[1]).strip() if row[1] else None,
                 "sales_order_line": str(row[2]).strip() if row[2] else None,
                 "customer_po": str(row[3]).strip() if row[3] else None,
-
                 "tracking_information": row[4],
-
                 "ship_to": {
                     "name": row[5],
                     "address_1": row[6],
@@ -1445,7 +1350,6 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
                     "phone": row[15],
                     "email": row[16]
                 },
-
                 "delivery_service": row[17],
                 "delivery_terms": row[18]
             }
@@ -1464,7 +1368,6 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
             "records_are_sales_order_lines": True,
             "shipments": shipments
         }
-
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
