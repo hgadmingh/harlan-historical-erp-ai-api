@@ -882,77 +882,72 @@ def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
         cursor = conn.cursor()
 
         cursor.execute("""
-            WITH CustomerAging AS
+            WITH MatchingCustomers AS
             (
                 SELECT
-                    site_ref,
-                    cust_num,
+                    c.CustNum,
+                    LTRIM(RTRIM(c.CustNum)) AS CustomerNumber,
+                    LTRIM(RTRIM(c.Name)) AS CustomerName,
 
-                    COUNT(*) AS TransactionRows,
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY LTRIM(RTRIM(c.CustNum))
+                        ORDER BY
+                            CASE WHEN c.CustSeq = 0 THEN 0 ELSE 1 END,
+                            c.CustSeq
+                    ) AS RowNum
 
-                    SUM(AgeBal1) AS CurrentBalance,
-                    SUM(AgeBal2) AS Balance1To30,
-                    SUM(AgeBal3) AS Balance31To60,
-                    SUM(AgeBal4) AS Balance61To90,
-                    SUM(AgeBal5) AS BalanceOver90,
+                FROM dbo.ESBCustomerView c
 
-                    SUM(AgeBal6) AS TotalARBalance
+                WHERE
+                    c.Name IS NOT NULL
+                    AND LTRIM(RTRIM(c.Name)) <> ''
+                    AND
+                    (
+                        c.Name LIKE %(search)s
+                        OR LTRIM(RTRIM(c.CustNum)) LIKE %(search)s
+                    )
+            ),
 
-                FROM dbo.AI_HistoricalARAgingView
-
-                GROUP BY
-                    site_ref,
-                    cust_num
+            SelectedCustomers AS
+            (
+                SELECT
+                    CustNum,
+                    CustomerNumber,
+                    CustomerName
+                FROM MatchingCustomers
+                WHERE RowNum = 1
             )
 
             SELECT TOP (25)
 
                 a.site_ref,
-                LTRIM(RTRIM(a.cust_num)) AS CustomerNumber,
-                n.CustomerName,
+                c.CustomerNumber,
+                c.CustomerName,
 
-                a.TransactionRows,
+                COUNT(*) AS TransactionRows,
 
-                a.CurrentBalance,
-                a.Balance1To30,
-                a.Balance31To60,
-                a.Balance61To90,
-                a.BalanceOver90,
+                SUM(a.AgeBal1) AS CurrentBalance,
+                SUM(a.AgeBal2) AS Balance1To30,
+                SUM(a.AgeBal3) AS Balance31To60,
+                SUM(a.AgeBal4) AS Balance61To90,
+                SUM(a.AgeBal5) AS BalanceOver90,
 
-                a.TotalARBalance
+                SUM(a.AgeBal6) AS TotalARBalance
 
-            FROM CustomerAging a
+            FROM SelectedCustomers c
 
-            OUTER APPLY
-            (
-                SELECT TOP (1)
-                    LTRIM(RTRIM(c.Name)) AS CustomerName
+            INNER JOIN dbo.AI_HistoricalARAgingView a
+                ON a.cust_num = c.CustNum
 
-                FROM dbo.ESBCustomerView c
-
-                WHERE
-                    LTRIM(RTRIM(c.CustNum)) =
-                        LTRIM(RTRIM(a.cust_num))
-
-                    AND c.Name IS NOT NULL
-                    AND LTRIM(RTRIM(c.Name)) <> ''
-
-                ORDER BY
-                    CASE
-                        WHEN c.CustSeq = 0 THEN 0
-                        ELSE 1
-                    END,
-                    c.CustSeq
-
-            ) n
-
-            WHERE
-                LTRIM(RTRIM(a.cust_num)) LIKE %(search)s
-                OR n.CustomerName LIKE %(search)s
+            GROUP BY
+                a.site_ref,
+                c.CustomerNumber,
+                c.CustomerName
 
             ORDER BY
-                a.TotalARBalance DESC,
-                CustomerNumber
+                TotalARBalance DESC,
+                c.CustomerNumber
 
         """, {"search": f"%{search}%"})
 
