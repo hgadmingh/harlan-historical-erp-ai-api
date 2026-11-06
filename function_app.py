@@ -1329,3 +1329,161 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+@app.route(
+    route="erp-shipping-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for shipping search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (50)
+
+                CoNum_and_CoLine,
+                co_Num,
+                Co_Line,
+                cust_po,
+
+                UfcoOrderTrack,
+
+                name,
+                add1,
+                add2,
+                add3,
+                add4,
+                city,
+                state,
+                zip,
+                county,
+                country,
+
+                phone2,
+                ship_to_email,
+
+                Uf_coDeliveryService,
+                Uf_coDeliveryTerm
+
+            FROM dbo.AA_ShippingView
+
+            WHERE
+                LTRIM(RTRIM(co_Num)) LIKE %(search)s
+
+                OR LTRIM(RTRIM(CoNum_and_CoLine))
+                    LIKE %(search)s
+
+                OR LTRIM(RTRIM(cust_po)) LIKE %(search)s
+
+                OR UfcoOrderTrack LIKE %(search)s
+
+            ORDER BY
+                co_Num DESC,
+                Co_Line
+
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        shipments = [
+            {
+                "sales_order_line_key": row[0],
+                "sales_order": str(row[1]).strip() if row[1] else None,
+                "sales_order_line": str(row[2]).strip() if row[2] else None,
+                "customer_po": str(row[3]).strip() if row[3] else None,
+
+                "tracking_information": row[4],
+
+                "ship_to": {
+                    "name": row[5],
+                    "address_1": row[6],
+                    "address_2": row[7],
+                    "address_3": row[8],
+                    "address_4": row[9],
+                    "city": row[10],
+                    "state": row[11],
+                    "postal_code": row[12],
+                    "county": row[13],
+                    "country": row[14],
+                    "phone": row[15],
+                    "email": row[16]
+                },
+
+                "delivery_service": row[17],
+                "delivery_terms": row[18]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Shipping and Tracking Search",
+            "data_status": "Historical static snapshot",
+            "as_of_date": "2025-12-31",
+            "source_view": "dbo.AA_ShippingView",
+            "search_term": search,
+            "returned_rows": len(shipments),
+            "maximum_rows": 50,
+            "records_are_sales_order_lines": True,
+            "shipments": shipments
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Shipping and Tracking Search",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
