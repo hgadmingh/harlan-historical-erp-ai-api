@@ -1125,6 +1125,7 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
 @app.route(
     route="erp-purchase-order-search",
     methods=["GET"],
@@ -1145,9 +1146,7 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
 
     if len(search) > 100:
         return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
             mimetype="application/json",
             status_code=400
         )
@@ -1173,76 +1172,71 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
         cursor.execute("""
             SELECT TOP (50)
 
-                p.type AS PurchaseOrderType,
+                PurchaseOrderType,
+                PoNum,
+                PoLine,
+                DerStat,
 
-                v.PoNum,
-                v.PoLine,
-                v.DerStat,
+                DerItem,
+                DerItemDescription,
 
-                v.DerItem,
-                v.DerItemDescription,
-
-                v.DerQuantity,
-                v.QtyReceivedConv,
-                v.DerOpenQuantity,
+                DerQuantity,
+                QtyReceivedConv,
+                DerOpenQuantity,
 
                 CASE
-                    WHEN p.type = 'R'
-                     AND v.QtyReceivedConv IS NOT NULL
-                    THEN v.DerQuantity - v.QtyReceivedConv
+                    WHEN PurchaseOrderType = 'R'
+                     AND QtyReceivedConv IS NOT NULL
+                    THEN DerQuantity - QtyReceivedConv
                     ELSE NULL
                 END AS CalculatedRemainingQuantity,
 
-                v.DerQuantityUnitCode,
-                v.DerUnitCostConv,
-                v.DerExtendedAmountConv,
-                v.DerTotalAmountConv,
-                v.CurrISOCurrCode,
+                DerQuantityUnitCode,
+                DerUnitCostConv,
+                DerExtendedAmountConv,
+                DerTotalAmountConv,
+                CurrISOCurrCode,
 
-                v.ItemRequiredDeliveryDateTime,
+                ItemRequiredDeliveryDateTime,
 
-                v.ReqNum,
-                v.ReqLine,
+                ReqNum,
+                ReqLine,
 
-                v.DerShipToLocation,
-                v.DerShipToName,
-                v.DerShipToAddr1,
-                v.DerShipToAddr2,
-                v.DerShipToAddr3,
-                v.DerShipToAddr4,
-                v.DerShipToCity,
-                v.DerShipToState,
-                v.DerShipToISOCountryCode,
-                v.DerShipToZip,
-                v.DerShipToContactName,
-                v.DerShipToPhone,
+                DerShipToLocation,
+                DerShipToName,
+                DerShipToAddr1,
+                DerShipToAddr2,
+                DerShipToAddr3,
+                DerShipToAddr4,
+                DerShipToCity,
+                DerShipToState,
+                DerShipToISOCountryCode,
+                DerShipToZip,
+                DerShipToContactName,
+                DerShipToPhone,
 
-                v.Incoterm,
+                Incoterm,
 
-                v.ProductionOrderRefID,
-                v.ProductionOrderRevID,
-                v.ProductionOrderDesc,
-                v.ProductionOrderStat
+                ProductionOrderRefID,
+                ProductionOrderRevID,
+                ProductionOrderDesc,
+                ProductionOrderStat
 
-            FROM dbo.ESBPurchaseOrderLineView v
-
-            INNER JOIN dbo.po p
-                ON LTRIM(RTRIM(p.po_num)) =
-                   LTRIM(RTRIM(v.PoNum))
+            FROM dbo.AI_PurchaseOrderLineSearchView
 
             WHERE
-                LTRIM(RTRIM(v.PoNum)) LIKE %(search)s
-                OR LTRIM(RTRIM(v.DerItem)) LIKE %(search)s
-                OR v.DerItemDescription LIKE %(search)s
+                LTRIM(RTRIM(PoNum)) LIKE %(search)s
+                OR LTRIM(RTRIM(DerItem)) LIKE %(search)s
+                OR DerItemDescription LIKE %(search)s
 
             ORDER BY
                 CASE
-                    WHEN v.ItemRequiredDeliveryDateTime IS NULL
+                    WHEN ItemRequiredDeliveryDateTime IS NULL
                     THEN 1 ELSE 0
                 END,
-                v.ItemRequiredDeliveryDateTime,
-                v.PoNum,
-                v.PoLine
+                ItemRequiredDeliveryDateTime,
+                PoNum,
+                PoLine
 
         """, {"search": f"%{search}%"})
 
@@ -1305,8 +1299,8 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "connection": "Success",
             "report": "Historical Purchase Order Line Search",
             "data_status": "Historical static snapshot",
+            "source_view": "dbo.AI_PurchaseOrderLineSearchView",
             "search_term": search,
-            "source_view": "dbo.ESBPurchaseOrderLineView",
             "returned_rows": len(purchase_orders),
             "maximum_rows": 50,
             "purchase_orders": purchase_orders
@@ -1334,3 +1328,4 @@ def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
