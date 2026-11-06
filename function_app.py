@@ -837,177 +837,6 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 @app.route(
-    route="erp-ar-customer-aging",
-    methods=["GET"],
-    auth_level=func.AuthLevel.FUNCTION
-)
-def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
-
-    search = (req.params.get("search") or "").strip()
-
-    if len(search) < 2:
-        return func.HttpResponse(
-            json.dumps({
-                "error": "Please provide at least two characters for customer search."
-            }),
-            mimetype="application/json",
-            status_code=400
-        )
-
-    if len(search) > 100:
-        return func.HttpResponse(
-            json.dumps({
-                "error": "Search term cannot exceed 100 characters."
-            }),
-            mimetype="application/json",
-            status_code=400
-        )
-
-    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
-    database = "HARLAN_APP_0709"
-
-    conn = None
-    cursor = None
-
-    try:
-        connection_string = (
-            f"Server={server},1433;"
-            f"Database={database};"
-            "Authentication=ActiveDirectoryMSI;"
-            "Encrypt=yes;"
-            "TrustServerCertificate=no;"
-        )
-
-        conn = mssql_python.connect(connection_string)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            WITH MatchingCustomers AS
-            (
-                SELECT
-                    c.CustNum,
-                    LTRIM(RTRIM(c.CustNum)) AS CustomerNumber,
-                    LTRIM(RTRIM(c.Name)) AS CustomerName,
-
-                    ROW_NUMBER() OVER
-                    (
-                        PARTITION BY LTRIM(RTRIM(c.CustNum))
-                        ORDER BY
-                            CASE WHEN c.CustSeq = 0 THEN 0 ELSE 1 END,
-                            c.CustSeq
-                    ) AS RowNum
-
-                FROM dbo.ESBCustomerView c
-
-                WHERE
-                    c.Name IS NOT NULL
-                    AND LTRIM(RTRIM(c.Name)) <> ''
-                    AND
-                    (
-                        c.Name LIKE %(search)s
-                        OR LTRIM(RTRIM(c.CustNum)) LIKE %(search)s
-                    )
-            ),
-
-            SelectedCustomers AS
-            (
-                SELECT
-                    CustNum,
-                    CustomerNumber,
-                    CustomerName
-                FROM MatchingCustomers
-                WHERE RowNum = 1
-            )
-
-            SELECT TOP (25)
-
-                a.site_ref,
-                c.CustomerNumber,
-                c.CustomerName,
-
-                COUNT(*) AS TransactionRows,
-
-                SUM(a.AgeBal1) AS CurrentBalance,
-                SUM(a.AgeBal2) AS Balance1To30,
-                SUM(a.AgeBal3) AS Balance31To60,
-                SUM(a.AgeBal4) AS Balance61To90,
-                SUM(a.AgeBal5) AS BalanceOver90,
-
-                SUM(a.AgeBal6) AS TotalARBalance
-
-            FROM SelectedCustomers c
-
-            INNER JOIN dbo.AI_HistoricalARAgingView a
-                ON a.cust_num = c.CustNum
-
-            GROUP BY
-                a.site_ref,
-                c.CustomerNumber,
-                c.CustomerName
-
-            ORDER BY
-                TotalARBalance DESC,
-                c.CustomerNumber
-
-        """, {"search": f"%{search}%"})
-
-        rows = cursor.fetchall()
-
-        customers = [
-            {
-                "site": row[0],
-                "customer_number": str(row[1]).strip() if row[1] else None,
-                "customer_name": row[2],
-                "transaction_rows": row[3],
-
-                "aging_buckets": {
-                    "current": row[4],
-                    "1_to_30_days": row[5],
-                    "31_to_60_days": row[6],
-                    "61_to_90_days": row[7],
-                    "over_90_days": row[8]
-                },
-
-                "total_ar_balance": row[9]
-            }
-            for row in rows
-        ]
-
-        result = {
-            "connection": "Success",
-            "report": "Historical Customer Accounts Receivable Aging",
-            "as_of_date": "2025-12-31",
-            "data_status": "Historical static snapshot",
-            "search_term": search,
-            "returned_rows": len(customers),
-            "maximum_rows": 25,
-            "customers": customers
-        }
-
-        return func.HttpResponse(
-            json.dumps(result, default=str, indent=2),
-            mimetype="application/json",
-            status_code=200
-        )
-
-    except Exception as e:
-        return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "report": "Historical Customer Accounts Receivable Aging",
-                "error": str(e)
-            }),
-            mimetype="application/json",
-            status_code=500
-        )
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
-@app.route(
     route="erp-ar-top-customers",
     methods=["GET"],
     auth_level=func.AuthLevel.FUNCTION
@@ -1124,6 +953,171 @@ def erp_ar_top_customers(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({
                 "connection": "Failed",
                 "report": "Top 10 Historical Accounts Receivable Customers",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+@app.route(
+    route="erp-ar-customer-aging",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_ar_customer_aging(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for customer search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            WITH MatchingCustomers AS
+            (
+                SELECT
+                    LTRIM(RTRIM(c.CustNum)) AS CustomerNumber,
+                    LTRIM(RTRIM(c.Name)) AS CustomerName,
+
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY LTRIM(RTRIM(c.CustNum))
+                        ORDER BY
+                            CASE WHEN c.CustSeq = 0 THEN 0 ELSE 1 END,
+                            c.CustSeq
+                    ) AS RowNum
+
+                FROM dbo.ESBCustomerView c
+
+                WHERE
+                    c.Name IS NOT NULL
+                    AND LTRIM(RTRIM(c.Name)) <> ''
+                    AND
+                    (
+                        c.Name LIKE %(search)s
+                        OR LTRIM(RTRIM(c.CustNum)) LIKE %(search)s
+                    )
+            ),
+
+            SelectedCustomers AS
+            (
+                SELECT
+                    CustomerNumber,
+                    CustomerName
+                FROM MatchingCustomers
+                WHERE RowNum = 1
+            )
+
+            SELECT TOP (25)
+
+                a.site_ref,
+                a.customer_number,
+                c.CustomerName,
+
+                a.transaction_rows,
+
+                a.current_balance,
+                a.balance_1_to_30,
+                a.balance_31_to_60,
+                a.balance_61_to_90,
+                a.balance_over_90,
+
+                a.total_ar_balance
+
+            FROM dbo.AI_HistoricalARCustomerSummary a
+
+            INNER JOIN SelectedCustomers c
+                ON a.customer_number = c.CustomerNumber
+
+            ORDER BY
+                a.total_ar_balance DESC,
+                a.customer_number
+
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        customers = [
+            {
+                "site": row[0],
+                "customer_number": str(row[1]).strip() if row[1] else None,
+                "customer_name": row[2],
+                "transaction_rows": row[3],
+
+                "aging_buckets": {
+                    "current": row[4],
+                    "1_to_30_days": row[5],
+                    "31_to_60_days": row[6],
+                    "61_to_90_days": row[7],
+                    "over_90_days": row[8]
+                },
+
+                "total_ar_balance": row[9]
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Customer Accounts Receivable Aging",
+            "as_of_date": "2025-12-31",
+            "data_status": "Historical static snapshot",
+            "summary_table": "dbo.AI_HistoricalARCustomerSummary",
+            "search_term": search,
+            "returned_rows": len(customers),
+            "maximum_rows": 25,
+            "customers": customers
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Customer Accounts Receivable Aging",
                 "error": str(e)
             }),
             mimetype="application/json",
