@@ -1124,3 +1124,213 @@ def erp_ar_aging_summary(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+@app.route(
+    route="erp-purchase-order-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def erp_purchase_order_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) < 2:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Please provide at least two characters for purchase order search."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Search term cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT TOP (50)
+
+                p.type AS PurchaseOrderType,
+
+                v.PoNum,
+                v.PoLine,
+                v.DerStat,
+
+                v.DerItem,
+                v.DerItemDescription,
+
+                v.DerQuantity,
+                v.QtyReceivedConv,
+                v.DerOpenQuantity,
+
+                CASE
+                    WHEN p.type = 'R'
+                     AND v.QtyReceivedConv IS NOT NULL
+                    THEN v.DerQuantity - v.QtyReceivedConv
+                    ELSE NULL
+                END AS CalculatedRemainingQuantity,
+
+                v.DerQuantityUnitCode,
+                v.DerUnitCostConv,
+                v.DerExtendedAmountConv,
+                v.DerTotalAmountConv,
+                v.CurrISOCurrCode,
+
+                v.ItemRequiredDeliveryDateTime,
+
+                v.ReqNum,
+                v.ReqLine,
+
+                v.DerShipToLocation,
+                v.DerShipToName,
+                v.DerShipToAddr1,
+                v.DerShipToAddr2,
+                v.DerShipToAddr3,
+                v.DerShipToAddr4,
+                v.DerShipToCity,
+                v.DerShipToState,
+                v.DerShipToISOCountryCode,
+                v.DerShipToZip,
+                v.DerShipToContactName,
+                v.DerShipToPhone,
+
+                v.Incoterm,
+
+                v.ProductionOrderRefID,
+                v.ProductionOrderRevID,
+                v.ProductionOrderDesc,
+                v.ProductionOrderStat
+
+            FROM dbo.ESBPurchaseOrderLineView v
+
+            INNER JOIN dbo.po p
+                ON LTRIM(RTRIM(p.po_num)) =
+                   LTRIM(RTRIM(v.PoNum))
+
+            WHERE
+                LTRIM(RTRIM(v.PoNum)) LIKE %(search)s
+                OR LTRIM(RTRIM(v.DerItem)) LIKE %(search)s
+                OR v.DerItemDescription LIKE %(search)s
+
+            ORDER BY
+                CASE
+                    WHEN v.ItemRequiredDeliveryDateTime IS NULL
+                    THEN 1 ELSE 0
+                END,
+                v.ItemRequiredDeliveryDateTime,
+                v.PoNum,
+                v.PoLine
+
+        """, {"search": f"%{search}%"})
+
+        rows = cursor.fetchall()
+
+        purchase_orders = [
+            {
+                "purchase_order_type": row[0],
+                "purchase_order_number": str(row[1]).strip() if row[1] else None,
+                "po_line": row[2],
+                "status": row[3],
+
+                "item_number": str(row[4]).strip() if row[4] else None,
+                "item_description": row[5],
+
+                "quantity_ordered": row[6],
+                "quantity_received": row[7],
+                "syteLine_open_quantity": row[8],
+                "calculated_remaining_quantity": row[9],
+
+                "unit_of_measure": row[10],
+                "unit_cost": row[11],
+                "extended_amount": row[12],
+                "total_amount": row[13],
+                "currency": row[14],
+
+                "required_delivery_date": row[15],
+
+                "requisition_number": row[16],
+                "requisition_line": row[17],
+
+                "ship_to": {
+                    "location_type": row[18],
+                    "name": row[19],
+                    "address_1": row[20],
+                    "address_2": row[21],
+                    "address_3": row[22],
+                    "address_4": row[23],
+                    "city": row[24],
+                    "state": row[25],
+                    "country": row[26],
+                    "postal_code": row[27],
+                    "contact": row[28],
+                    "phone": row[29]
+                },
+
+                "incoterm": row[30],
+
+                "production_order": {
+                    "reference": row[31],
+                    "revision": row[32],
+                    "description": row[33],
+                    "status": row[34]
+                }
+            }
+            for row in rows
+        ]
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Purchase Order Line Search",
+            "data_status": "Historical static snapshot",
+            "search_term": search,
+            "source_view": "dbo.ESBPurchaseOrderLineView",
+            "returned_rows": len(purchase_orders),
+            "maximum_rows": 50,
+            "purchase_orders": purchase_orders
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Purchase Order Line Search",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
