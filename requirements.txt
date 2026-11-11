@@ -1,2 +1,4 @@
 azure-functions
 mssql-python
+azure-identity
+azure-storage-blob
