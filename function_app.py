@@ -671,6 +671,222 @@ def erp_sales_order_export(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+
+# =========================================================
+# 5. PRODUCTION ORDER CSV EXPORT
+# Exports all historical production orders.
+# =========================================================
+
+@app.route(
+    route="erp-production-export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
+
+    search = (req.params.get("search") or "").strip()
+
+    if len(search) > 100:
+        return func.HttpResponse(
+            json.dumps({"error": "Search term cannot exceed 100 characters."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    storage_account = os.environ.get("ERP_EXPORT_STORAGE_ACCOUNT")
+    container_name = os.environ.get("ERP_EXPORT_CONTAINER")
+
+    if not storage_account or not container_name:
+        return func.HttpResponse(
+            json.dumps({"error": "Export storage configuration is missing."}),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    conn = None
+    cursor = None
+
+    try:
+        server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+        database = "HARLAN_APP_0709"
+
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        sql = """
+            SELECT
+                Job, Suffix, Item, ItemDescription, Description,
+                Status, StatusDesc, OrderQty, DueQty, ProducedQty,
+                ItemUM, StartDate, EndDate, DueDate,
+                EstMatlCost, EstLaborCost, EstFixOvhdCost,
+                EstVarOvhdCost, EstOutsideCost, EstBurdenCost,
+                EstTotalCost, ActMatlCost, ActLaborCost,
+                ActFixOvhdCost, ActVarOvhdCost, ActOutsideCost,
+                ActBurdenCost, ActTotalCost, WhseID
+            FROM dbo.ESBProductionOrderView
+        """
+
+        params = {}
+
+        if search:
+            sql += """
+                WHERE
+                    LTRIM(RTRIM(Job)) LIKE %(search)s
+                    OR LTRIM(RTRIM(Item)) LIKE %(search)s
+                    OR ItemDescription LIKE %(search)s
+                    OR Description LIKE %(search)s
+                    OR Status LIKE %(search)s
+                    OR StatusDesc LIKE %(search)s
+            """
+            params["search"] = f"%{search}%"
+
+        sql += """
+            ORDER BY
+                CASE WHEN DueDate IS NULL THEN 1 ELSE 0 END,
+                DueDate, Job, Suffix
+        """
+
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Job Number",
+            "Job Suffix",
+            "Item",
+            "Item Description",
+            "Production Description",
+            "Status",
+            "Status Description",
+            "Order Quantity",
+            "Due Quantity",
+            "Produced Quantity",
+            "Unit of Measure",
+            "Start Date",
+            "End Date",
+            "Due Date",
+            "Estimated Material Cost",
+            "Estimated Labor Cost",
+            "Estimated Fixed Overhead",
+            "Estimated Variable Overhead",
+            "Estimated Outside Cost",
+            "Estimated Burden Cost",
+            "Estimated Total Cost",
+            "Actual Material Cost",
+            "Actual Labor Cost",
+            "Actual Fixed Overhead",
+            "Actual Variable Overhead",
+            "Actual Outside Cost",
+            "Actual Burden Cost",
+            "Actual Total Cost",
+            "Warehouse"
+        ])
+
+        for row in rows:
+            writer.writerow([
+                str(value).strip() if isinstance(value, str) else value
+                for value in row
+            ])
+
+        csv_content = output.getvalue().encode("utf-8-sig")
+        output.close()
+
+        credential = DefaultAzureCredential()
+        account_url = f"https://{storage_account}.blob.core.windows.net"
+
+        blob_service = BlobServiceClient(
+            account_url=account_url,
+            credential=credential
+        )
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]
+
+        blob_name = (
+            f"production-orders/"
+            f"production-orders-{timestamp}-{unique_id}.csv"
+        )
+
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+
+        blob_client.upload_blob(
+            csv_content,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type="text/csv; charset=utf-8"
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        starts_on = now - timedelta(minutes=5)
+        expires_on = now + timedelta(minutes=15)
+
+        delegation_key = blob_service.get_user_delegation_key(
+            key_start_time=starts_on,
+            key_expiry_time=expires_on
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=starts_on,
+            expiry=expires_on
+        )
+
+        download_url = f"{blob_client.url}?{sas_token}"
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Success",
+                "view": "dbo.ESBProductionOrderView",
+                "search_term": search or "ALL",
+                "exported_rows": len(rows),
+                "file_name": blob_name.split("/")[-1],
+                "container": container_name,
+                "download_url": download_url,
+                "link_expires_utc": expires_on.isoformat(),
+                "message": "Production order CSV export created successfully."
+            }, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception:
+        # Avoid returning internal database or storage details.
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": "Production order export failed. Check Function App logs."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
 # =========================================================
 # 4. INVENTORY SEARCH (INCLUDES PRICING)
 # =========================================================
