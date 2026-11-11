@@ -310,8 +310,9 @@ def erp_customer_search(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 
+
 # =========================================================
-# 3. SALES ORDER SEARCH
+# 3. SALES ORDER SEARCH WITH PAGINATION
 # =========================================================
 
 @app.route(
@@ -329,9 +330,41 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=400
         )
+
     if len(search) > 100:
         return func.HttpResponse(
             json.dumps({"error": "Search term cannot exceed 100 characters."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # Pagination parameters
+    try:
+        page_size = int(req.params.get("page_size", "100"))
+        offset = int(req.params.get("offset", "0"))
+    except (ValueError, TypeError):
+        return func.HttpResponse(
+            json.dumps({
+                "error": "page_size and offset must be valid integers."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if page_size < 1 or page_size > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "page_size must be between 1 and 100."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if offset < 0:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "offset cannot be negative."
+            }),
             mimetype="application/json",
             status_code=400
         )
@@ -349,11 +382,28 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             "Encrypt=yes;"
             "TrustServerCertificate=no;"
         )
+
         conn = mssql_python.connect(connection_string)
         cursor = conn.cursor()
 
+        search_params = {"search": f"%{search}%"}
+
+        # Count all matching records
         cursor.execute("""
-            SELECT TOP (25)
+            SELECT COUNT_BIG(*)
+            FROM dbo.ESBSalesOrderView
+            WHERE
+                LTRIM(RTRIM(CoNum)) LIKE %(search)s
+                OR LTRIM(RTRIM(CustomerID)) LIKE %(search)s
+                OR CustomerName LIKE %(search)s
+                OR CustPo LIKE %(search)s
+        """, search_params)
+
+        total_matching_rows = int(cursor.fetchone()[0])
+
+        # Retrieve the requested page
+        cursor.execute("""
+            SELECT
                 CoNum, OrderDate, DerStat, DerStatDescription,
                 CustomerID, CustomerName, CustPo, DerExtAmt, Whse
             FROM dbo.ESBSalesOrderView
@@ -362,10 +412,17 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
                 OR LTRIM(RTRIM(CustomerID)) LIKE %(search)s
                 OR CustomerName LIKE %(search)s
                 OR CustPo LIKE %(search)s
-            ORDER BY OrderDate DESC
-        """, {"search": f"%{search}%"})
+            ORDER BY OrderDate DESC, CoNum DESC
+            OFFSET %(offset)s ROWS
+            FETCH NEXT %(page_size)s ROWS ONLY
+        """, {
+            "search": f"%{search}%",
+            "offset": offset,
+            "page_size": page_size
+        })
 
         rows = cursor.fetchall()
+
         orders = [
             {
                 "sales_order": str(row[0]).strip() if row[0] else None,
@@ -381,13 +438,22 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
             for row in rows
         ]
 
+        next_offset = offset + len(orders)
+        has_more = next_offset < total_matching_rows
+
         result = {
             "connection": "Success",
             "view": "dbo.ESBSalesOrderView",
             "search_term": search,
+            "total_matching_rows": total_matching_rows,
             "returned_rows": len(orders),
+            "page_size": page_size,
+            "offset": offset,
+            "next_offset": next_offset if has_more else None,
+            "has_more": has_more,
             "sales_orders": orders
         }
+
         return func.HttpResponse(
             json.dumps(result, default=str, indent=2),
             mimetype="application/json",
