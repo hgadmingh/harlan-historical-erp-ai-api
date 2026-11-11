@@ -6,6 +6,7 @@ import json
 import mssql_python
 import os
 import uuid
+import logging
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -1139,15 +1140,16 @@ def erp_purchase_order_export(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200
         )
 
-    except Exception:
-        return func.HttpResponse(
-            json.dumps({
-                "connection": "Failed",
-                "error": "Purchase order export failed. Check Function App logs."
-            }),
-            mimetype="application/json",
-            status_code=500
-        )
+        except Exception:
+            logging.exception("Purchase Order CSV export failed")
+            return func.HttpResponse(
+                json.dumps({
+                    "connection": "Failed",
+                    "error": "Purchase order export failed. Check Function App logs."
+                }),
+                mimetype="application/json",
+                status_code=500
+            )
 
     finally:
         if cursor:
