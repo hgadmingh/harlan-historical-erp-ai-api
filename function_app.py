@@ -673,9 +673,10 @@ def erp_sales_order_export(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 
+
 # =========================================================
 # 5. PRODUCTION ORDER CSV EXPORT
-# Exports all historical production orders.
+# Exports historical production orders for an exact item.
 # =========================================================
 
 @app.route(
@@ -686,11 +687,22 @@ def erp_sales_order_export(req: func.HttpRequest) -> func.HttpResponse:
 @require_erp_access
 def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
 
-    search = (req.params.get("search") or "").strip()
+    item_number = (req.params.get("item_number") or "").strip()
 
-    if len(search) > 100:
+    if not item_number:
         return func.HttpResponse(
-            json.dumps({"error": "Search term cannot exceed 100 characters."}),
+            json.dumps({
+                "error": "An item_number is required. Provide an exact item number."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(item_number) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Item number cannot exceed 100 characters."
+            }),
             mimetype="application/json",
             status_code=400
         )
@@ -700,7 +712,9 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
 
     if not storage_account or not container_name:
         return func.HttpResponse(
-            json.dumps({"error": "Export storage configuration is missing."}),
+            json.dumps({
+                "error": "Export storage configuration is missing."
+            }),
             mimetype="application/json",
             status_code=500
         )
@@ -734,29 +748,13 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
                 ActFixOvhdCost, ActVarOvhdCost, ActOutsideCost,
                 ActBurdenCost, ActTotalCost, WhseID
             FROM dbo.ESBProductionOrderView
-        """
-
-        params = {}
-
-        if search:
-            sql += """
-                WHERE
-                    LTRIM(RTRIM(Job)) LIKE %(search)s
-                    OR LTRIM(RTRIM(Item)) LIKE %(search)s
-                    OR ItemDescription LIKE %(search)s
-                    OR Description LIKE %(search)s
-                    OR Status LIKE %(search)s
-                    OR StatusDesc LIKE %(search)s
-            """
-            params["search"] = f"%{search}%"
-
-        sql += """
+            WHERE LTRIM(RTRIM(Item)) = %(item_number)s
             ORDER BY
                 CASE WHEN DueDate IS NULL THEN 1 ELSE 0 END,
                 DueDate, Job, Suffix
         """
 
-        cursor.execute(sql, params)
+        cursor.execute(sql, {"item_number": item_number})
         rows = cursor.fetchall()
 
         output = io.StringIO()
@@ -816,6 +814,7 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
 
         blob_name = (
             f"production-orders/"
+            f"item-{item_number}/"
             f"production-orders-{timestamp}-{unique_id}.csv"
         )
 
@@ -857,7 +856,7 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps({
                 "connection": "Success",
                 "view": "dbo.ESBProductionOrderView",
-                "search_term": search or "ALL",
+                "item_number": item_number,
                 "exported_rows": len(rows),
                 "file_name": blob_name.split("/")[-1],
                 "container": container_name,
@@ -870,7 +869,6 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception:
-        # Avoid returning internal database or storage details.
         return func.HttpResponse(
             json.dumps({
                 "connection": "Failed",
