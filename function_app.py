@@ -886,6 +886,276 @@ def erp_production_export(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # =========================================================
+# 6. PURCHASE ORDER CSV EXPORT
+# Exports historical purchase orders by vendor, PO number,
+# or both. Includes header and line-level details.
+# Historical cutoff: 2025-12-31.
+# =========================================================
+
+@app.route(
+    route="erp-purchase-order-export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_purchase_order_export(req: func.HttpRequest) -> func.HttpResponse:
+
+    vendor_number = (req.params.get("vendor_number") or "").strip()
+    po_number = (req.params.get("po_number") or "").strip()
+
+    if not vendor_number and not po_number:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Provide a vendor_number, po_number, or both."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(vendor_number) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Vendor number cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(po_number) > 100:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Purchase order number cannot exceed 100 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    storage_account = os.environ.get("ERP_EXPORT_STORAGE_ACCOUNT")
+    container_name = os.environ.get("ERP_EXPORT_CONTAINER")
+
+    if not storage_account or not container_name:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Export storage configuration is missing."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    conn = None
+    cursor = None
+
+    try:
+        server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+        database = "HARLAN_APP_0709"
+
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        conditions = [
+            "p.order_date < '2026-01-01'"
+        ]
+
+        parameters = {}
+
+        if vendor_number:
+            conditions.append(
+                "LTRIM(RTRIM(p.vend_num)) = %(vendor_number)s"
+            )
+            parameters["vendor_number"] = vendor_number
+
+        if po_number:
+            conditions.append(
+                "LTRIM(RTRIM(p.po_num)) = %(po_number)s"
+            )
+            parameters["po_number"] = po_number
+
+        where_clause = " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                p.po_num,
+                p.order_date,
+                p.stat,
+                p.vend_num,
+                v.Name AS VendorName,
+                p.vend_order,
+                p.buyer,
+                p.whse,
+                p.terms_code,
+                p.ship_code,
+                p.po_cost,
+                p.freight,
+                p.sales_tax,
+                l.PoLine,
+                l.DerStat,
+                l.DerItem,
+                l.DerItemDescription,
+                l.DerQuantity,
+                l.DerQuantityUnitCode,
+                l.DerUnitCostConv,
+                l.DerExtendedAmountConv,
+                l.DerTotalAmountConv,
+                l.QtyReceivedConv,
+                l.DerOpenQuantity,
+                l.ItemRequiredDeliveryDateTime,
+                l.CurrISOCurrCode,
+                l.ProductionOrderRefID,
+                l.ProductionOrderRevID,
+                l.ProductionOrderDesc
+            FROM dbo.po p
+            INNER JOIN dbo.ESBPurchaseOrderLineView l
+                ON p.po_num = l.PoNum
+            LEFT JOIN dbo.ESBVendorView v
+                ON LTRIM(RTRIM(p.vend_num)) =
+                   LTRIM(RTRIM(v.VendNum))
+            WHERE {where_clause}
+            ORDER BY
+                p.order_date DESC,
+                p.po_num DESC,
+                l.PoLine
+        """
+
+        cursor.execute(sql, parameters)
+        rows = cursor.fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Purchase Order Number",
+            "Order Date",
+            "PO Status",
+            "Vendor Number",
+            "Vendor Name",
+            "Vendor Order Reference",
+            "Buyer",
+            "Warehouse",
+            "Payment Terms",
+            "Shipping Method",
+            "PO Header Cost",
+            "Freight",
+            "Sales Tax",
+            "PO Line",
+            "Line Status",
+            "Item Number",
+            "Item Description",
+            "Order Quantity",
+            "Unit of Measure",
+            "Unit Cost",
+            "Extended Amount",
+            "Line Total Amount",
+            "Quantity Received",
+            "Open Quantity",
+            "Required Delivery Date",
+            "Currency",
+            "Production Order Reference",
+            "Production Order Revision",
+            "Production Order Description"
+        ])
+
+        for row in rows:
+            writer.writerow([
+                str(value).strip() if isinstance(value, str) else value
+                for value in row
+            ])
+
+        csv_content = output.getvalue().encode("utf-8-sig")
+        output.close()
+
+        credential = DefaultAzureCredential()
+        account_url = f"https://{storage_account}.blob.core.windows.net"
+
+        blob_service = BlobServiceClient(
+            account_url=account_url,
+            credential=credential
+        )
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]
+
+        blob_name = (
+            f"purchase-orders/"
+            f"purchase-orders-{timestamp}-{unique_id}.csv"
+        )
+
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+
+        blob_client.upload_blob(
+            csv_content,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type="text/csv; charset=utf-8"
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        starts_on = now - timedelta(minutes=5)
+        expires_on = now + timedelta(minutes=15)
+
+        delegation_key = blob_service.get_user_delegation_key(
+            key_start_time=starts_on,
+            key_expiry_time=expires_on
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=starts_on,
+            expiry=expires_on
+        )
+
+        download_url = f"{blob_client.url}?{sas_token}"
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Success",
+                "view": "dbo.po + dbo.ESBPurchaseOrderLineView",
+                "vendor_number": vendor_number or None,
+                "po_number": po_number or None,
+                "historical_cutoff": "2025-12-31",
+                "exported_rows": len(rows),
+                "file_name": blob_name.split("/")[-1],
+                "container": container_name,
+                "download_url": download_url,
+                "link_expires_utc": expires_on.isoformat(),
+                "message": "Historical purchase order CSV export created successfully."
+            }, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": "Purchase order export failed. Check Function App logs."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+# =========================================================
 # 4. INVENTORY SEARCH (INCLUDES PRICING)
 # =========================================================
 
