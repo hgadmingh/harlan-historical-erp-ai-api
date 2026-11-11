@@ -489,6 +489,189 @@ def erp_sales_order_search(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # =========================================================
+# 4. SALES ORDER CSV EXPORT
+# Exact customer number match; exports all matching rows.
+# =========================================================
+
+@app.route(
+    route="erp-sales-order-export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_sales_order_export(req: func.HttpRequest) -> func.HttpResponse:
+
+    customer_number = (req.params.get("customer_number") or "").strip()
+
+    if not customer_number:
+        return func.HttpResponse(
+            json.dumps({"error": "Please provide a customer number."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(customer_number) > 50:
+        return func.HttpResponse(
+            json.dumps({"error": "Customer number is too long."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    storage_account = os.environ.get("ERP_EXPORT_STORAGE_ACCOUNT")
+    container_name = os.environ.get("ERP_EXPORT_CONTAINER")
+
+    if not storage_account or not container_name:
+        return func.HttpResponse(
+            json.dumps({"error": "Export storage configuration is missing."}),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    conn = None
+    cursor = None
+
+    try:
+        # Connect to historical SyteLine SQL database.
+        server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+        database = "HARLAN_APP_0709"
+
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        # Exact customer-number match.
+        cursor.execute("""
+            SELECT
+                CoNum, OrderDate, DerStat, DerStatDescription,
+                CustomerID, CustomerName, CustPo, DerExtAmt, Whse
+            FROM dbo.ESBSalesOrderView
+            WHERE LTRIM(RTRIM(CustomerID)) = %(customer_number)s
+            ORDER BY OrderDate DESC, CoNum DESC
+        """, {"customer_number": customer_number})
+
+        rows = cursor.fetchall()
+
+        # Generate CSV in memory.
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Sales Order",
+            "Order Date",
+            "Status",
+            "Status Description",
+            "Customer Number",
+            "Customer Name",
+            "Customer PO",
+            "Order Amount",
+            "Warehouse"
+        ])
+
+        for row in rows:
+            writer.writerow([
+                str(row[0]).strip() if row[0] else "",
+                row[1],
+                row[2],
+                row[3],
+                str(row[4]).strip() if row[4] else "",
+                row[5],
+                row[6],
+                row[7],
+                row[8]
+            ])
+
+        csv_content = output.getvalue().encode("utf-8-sig")
+        output.close()
+
+        # Use the Function App's managed identity.
+        credential = DefaultAzureCredential()
+
+        account_url = f"https://{storage_account}.blob.core.windows.net"
+
+        blob_service = BlobServiceClient(
+            account_url=account_url,
+            credential=credential
+        )
+
+        blob_name = (
+            f"sales-orders/customer-{customer_number}/"
+            f"sales-orders-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-"
+            f"{uuid.uuid4().hex[:8]}.csv"
+        )
+
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+
+        blob_client.upload_blob(
+            csv_content,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type="text/csv; charset=utf-8"
+            )
+        )
+
+        # Generate a short-lived user-delegation SAS URL.
+        now = datetime.now(timezone.utc)
+        starts_on = now - timedelta(minutes=5)
+        expires_on = now + timedelta(minutes=15)
+
+        delegation_key = blob_service.get_user_delegation_key(
+            key_start_time=starts_on,
+            key_expiry_time=expires_on
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=starts_on,
+            expiry=expires_on
+        )
+
+        download_url = f"{blob_client.url}?{sas_token}"
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Success",
+                "customer_number": customer_number,
+                "exported_rows": len(rows),
+                "file_name": blob_name.split("/")[-1],
+                "container": container_name,
+                "download_url": download_url,
+                "link_expires_utc": expires_on.isoformat(),
+                "message": "CSV export created successfully."
+            }, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+# =========================================================
 # 4. INVENTORY SEARCH (INCLUDES PRICING)
 # =========================================================
 
