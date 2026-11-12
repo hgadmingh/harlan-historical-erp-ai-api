@@ -2475,6 +2475,7 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
             conn.close()
 
 
+
 # =========================================================
 # 12. HISTORICAL MATERIAL TRANSACTION SEARCH
 # =========================================================
@@ -2488,7 +2489,7 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
 def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
 
     item_number = (req.params.get("item_number") or "").strip()
-    transaction_type = (req.params.get("transaction_type") or "").strip()
+    transaction_type = (req.params.get("transaction_type") or "").strip().upper()
     start_date = (req.params.get("start_date") or "").strip()
     end_date = (req.params.get("end_date") or "").strip()
 
@@ -2562,11 +2563,7 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
                 + timedelta(days=1)
             )
 
-        if (
-            start_date
-            and end_date
-            and start_date > end_date
-        ):
+        if start_date and end_date and start_date > end_date:
             raise ValueError("Start date cannot be after end date.")
 
     except ValueError as e:
@@ -2601,9 +2598,7 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
 
     if after_trans_date and after_trans_num:
         try:
-            cursor_datetime = datetime.fromisoformat(
-                after_trans_date
-            )
+            cursor_datetime = datetime.fromisoformat(after_trans_date)
             cursor_transaction_number = int(after_trans_num)
 
         except (ValueError, TypeError):
@@ -2650,8 +2645,7 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
         ]
 
         parameters = {
-            "item_number": item_number,
-            "fetch_count": page_size + 1
+            "item_number": item_number
         }
 
         if transaction_type:
@@ -2688,6 +2682,9 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
 
         where_clause = " AND ".join(where_conditions)
 
+        # page_size is validated as an integer between 1 and 100.
+        fetch_count = page_size + 1
+
         # -------------------------------------------------
         # QUERY MATERIAL TRANSACTIONS
         # Fetch one extra row to determine whether another
@@ -2695,7 +2692,7 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
         # -------------------------------------------------
 
         sql_query = f"""
-            SELECT TOP (%(fetch_count)s)
+            SELECT TOP ({fetch_count})
                 mt.trans_num AS TransactionNumber,
                 mt.trans_date AS TransactionDate,
                 mt.trans_type AS TransactionType,
@@ -2737,38 +2734,56 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
         returned_rows = rows[:page_size]
 
         # -------------------------------------------------
-        # FORMAT RESPONSE RECORDS
+        # JSON VALUE CONVERSION HELPERS
         # -------------------------------------------------
 
-        transactions = [
-            {
-                "transaction_number": str(row[0]) if row[0] is not None else None,
+        def json_number(value):
+            if value is None:
+                return None
+            return float(value)
+
+        def json_integer(value):
+            if value is None:
+                return None
+            return int(value)
+
+        # -------------------------------------------------
+        # FORMAT RESPONSE RECORDS
+        # Explicit numeric conversion prevents connector
+        # schema validation errors.
+        # -------------------------------------------------
+
+        transactions = []
+
+        for row in returned_rows:
+            transactions.append({
+                "transaction_number": (
+                    str(row[0]) if row[0] is not None else None
+                ),
                 "transaction_date": row[1],
                 "transaction_type": row[2].strip() if row[2] else None,
                 "item_number": row[3].strip() if row[3] else None,
                 "item_description": row[4],
                 "warehouse": row[5].strip() if row[5] else None,
                 "location": row[6].strip() if row[6] else None,
-                "quantity": row[7],
-                "unit_cost": row[8],
-                "material_cost": row[9],
-                "labor_cost": row[10],
-                "fixed_overhead_cost": row[11],
-                "variable_overhead_cost": row[12],
-                "outside_cost": row[13],
+                "quantity": json_number(row[7]),
+                "unit_cost": json_number(row[8]),
+                "material_cost": json_number(row[9]),
+                "labor_cost": json_number(row[10]),
+                "fixed_overhead_cost": json_number(row[11]),
+                "variable_overhead_cost": json_number(row[12]),
+                "outside_cost": json_number(row[13]),
                 "reference_type": row[14].strip() if row[14] else None,
                 "reference_number": row[15].strip() if row[15] else None,
-                "reference_line": row[16],
-                "reference_release": row[17],
+                "reference_line": json_integer(row[16]),
+                "reference_release": json_integer(row[17]),
                 "lot": row[18].strip() if row[18] else None,
                 "reason_code": row[19].strip() if row[19] else None,
                 "user_code": row[20].strip() if row[20] else None,
                 "work_center": row[21].strip() if row[21] else None,
                 "document_number": row[22].strip() if row[22] else None,
-                "backflush": row[23]
-            }
-            for row in returned_rows
-        ]
+                "backflush": json_integer(row[23])
+            })
 
         # -------------------------------------------------
         # BUILD NEXT-PAGE CURSOR
@@ -2781,7 +2796,8 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
 
             next_cursor = {
                 "after_trans_date": last_row[1].isoformat(
-                    sep=" ", timespec="milliseconds"
+                    sep=" ",
+                    timespec="milliseconds"
                 ),
                 "after_trans_num": str(last_row[0])
             }
