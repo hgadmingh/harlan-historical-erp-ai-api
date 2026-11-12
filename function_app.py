@@ -1157,6 +1157,340 @@ def erp_purchase_order_export(req: func.HttpRequest) -> func.HttpResponse:
         if conn:
             conn.close()
 
+
+
+# =========================================================
+# 12. SHIPPING CSV EXPORT
+# Exports historical shipping records by sales order,
+# sales order line, customer PO, tracking number, or
+# a combination of filters.
+# Historical cutoff: 2025-12-31.
+# One row per sales order release.
+# =========================================================
+
+@app.route(
+    route="erp-shipping-export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_shipping_export(req: func.HttpRequest) -> func.HttpResponse:
+
+    sales_order = (req.params.get("sales_order") or "").strip()
+    sales_order_line = (req.params.get("sales_order_line") or "").strip()
+    customer_po = (req.params.get("customer_po") or "").strip()
+    tracking_number = (req.params.get("tracking_number") or "").strip()
+
+    if not any([
+        sales_order,
+        sales_order_line,
+        customer_po,
+        tracking_number
+    ]):
+        return func.HttpResponse(
+            json.dumps({
+                "error": (
+                    "Provide at least one filter: sales_order, "
+                    "sales_order_line, customer_po, or tracking_number."
+                )
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    filters = {
+        "sales_order": sales_order,
+        "sales_order_line": sales_order_line,
+        "customer_po": customer_po,
+        "tracking_number": tracking_number
+    }
+
+    for field, value in filters.items():
+        if len(value) > 250:
+            return func.HttpResponse(
+                json.dumps({
+                    "error": f"{field} cannot exceed 250 characters."
+                }),
+                mimetype="application/json",
+                status_code=400
+            )
+
+    storage_account = os.environ.get("ERP_EXPORT_STORAGE_ACCOUNT")
+    container_name = os.environ.get("ERP_EXPORT_CONTAINER")
+
+    if not storage_account or not container_name:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Export storage configuration is missing."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    conn = None
+    cursor = None
+
+    try:
+        server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+        database = "HARLAN_APP_0709"
+
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        conditions = [
+            "c.ship_date IS NOT NULL",
+            "c.ship_date < '2026-01-01'"
+        ]
+
+        parameters = {}
+
+        if sales_order:
+            conditions.append(
+                "LTRIM(RTRIM(c.co_num)) = %(sales_order)s"
+            )
+            parameters["sales_order"] = sales_order
+
+        if sales_order_line:
+            conditions.append(
+                """
+                LTRIM(RTRIM(
+                    CONCAT(
+                        c.co_num,
+                        c.co_line
+                    )
+                )) = %(sales_order_line)s
+                """
+            )
+            parameters["sales_order_line"] = sales_order_line
+
+        if customer_po:
+            conditions.append(
+                "LTRIM(RTRIM(h.cust_po)) = %(customer_po)s"
+            )
+            parameters["customer_po"] = customer_po
+
+        if tracking_number:
+            conditions.append(
+                "h.UfcoOrderTrack LIKE %(tracking_number)s"
+            )
+            parameters["tracking_number"] = f"%{tracking_number}%"
+
+        where_clause = " AND ".join(conditions)
+
+        sql = f"""
+            SELECT
+                CONCAT(
+                    c.co_num, '-',
+                    c.co_line, '-',
+                    c.co_release
+                ) AS SalesOrderReleaseKey,
+
+                c.co_num,
+                c.co_line,
+                c.co_release,
+
+                h.cust_po,
+                h.UfcoOrderTrack,
+
+                a.name,
+                a.[addr##1],
+                a.[addr##2],
+                a.[addr##3],
+                a.[addr##4],
+                a.city,
+                a.state,
+                a.zip,
+                a.county,
+                a.country,
+                a.fax_num,
+
+                cu.[phone##2],
+                cu.UfCusFrtAcct,
+
+                a.ship_to_email,
+
+                c.Uf_coDeliveryService,
+                c.Uf_coDeliveryTerm,
+                c.Uf_coDeliveryCustAcct,
+
+                c.ship_date,
+                c.qty_shipped
+
+            FROM dbo.coitem c
+
+            INNER JOIN dbo.co h
+                ON h.co_num = c.co_num
+
+            INNER JOIN dbo.customer cu
+                ON cu.cust_num = h.cust_num
+                AND cu.cust_seq = h.cust_seq
+
+            INNER JOIN dbo.custaddr a
+                ON a.cust_num = cu.cust_num
+                AND a.cust_seq = cu.cust_seq
+
+            WHERE {where_clause}
+
+            ORDER BY
+                c.ship_date DESC,
+                c.co_num DESC,
+                c.co_line,
+                c.co_release
+        """
+
+        cursor.execute(sql, parameters)
+        rows = cursor.fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Sales Order Release Key",
+            "Sales Order Number",
+            "Sales Order Line",
+            "Release Number",
+            "Customer PO",
+            "Tracking Information",
+            "Ship To Name",
+            "Address 1",
+            "Address 2",
+            "Address 3",
+            "Address 4",
+            "City",
+            "State",
+            "ZIP",
+            "County",
+            "Country",
+            "Fax",
+            "Phone",
+            "UPS Customer Freight Account",
+            "Shipping Email",
+            "Delivery Service",
+            "Delivery Terms",
+            "Customer Delivery Account",
+            "Ship Date",
+            "Quantity Shipped"
+        ])
+
+        for row in rows:
+            writer.writerow([
+                str(value).strip() if isinstance(value, str) else value
+                for value in row
+            ])
+
+        csv_content = output.getvalue().encode("utf-8-sig")
+        output.close()
+
+        credential = DefaultAzureCredential()
+        account_url = f"https://{storage_account}.blob.core.windows.net"
+
+        blob_service = BlobServiceClient(
+            account_url=account_url,
+            credential=credential
+        )
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]
+
+        blob_name = (
+            f"shipping/"
+            f"shipping-{timestamp}-{unique_id}.csv"
+        )
+
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+
+        blob_client.upload_blob(
+            csv_content,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type="text/csv; charset=utf-8"
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        starts_on = now - timedelta(minutes=5)
+        expires_on = now + timedelta(minutes=15)
+
+        delegation_key = blob_service.get_user_delegation_key(
+            key_start_time=starts_on,
+            key_expiry_time=expires_on
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=starts_on,
+            expiry=expires_on
+        )
+
+        download_url = f"{blob_client.url}?{sas_token}"
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Success",
+                "source_tables": [
+                    "dbo.coitem",
+                    "dbo.co",
+                    "dbo.customer",
+                    "dbo.custaddr"
+                ],
+                "sales_order": sales_order or None,
+                "sales_order_line": sales_order_line or None,
+                "customer_po": customer_po or None,
+                "tracking_number": tracking_number or None,
+                "historical_cutoff": "2025-12-31",
+                "date_field": "dbo.coitem.ship_date",
+                "record_granularity": "One row per sales order release",
+                "exported_rows": len(rows),
+                "file_name": blob_name.split("/")[-1],
+                "container": container_name,
+                "download_url": download_url,
+                "link_expires_utc": expires_on.isoformat(),
+                "message": (
+                    "Historical shipping CSV export created successfully."
+                )
+            }, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception:
+        logging.exception("Shipping CSV export failed")
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": (
+                    "Shipping export failed. "
+                    "Check Function App logs."
+                )
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+
+
 # =========================================================
 # 4. INVENTORY SEARCH (INCLUDES PRICING)
 # =========================================================
