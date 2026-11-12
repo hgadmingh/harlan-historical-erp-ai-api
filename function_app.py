@@ -2473,3 +2473,369 @@ def erp_shipping_search(req: func.HttpRequest) -> func.HttpResponse:
             cursor.close()
         if conn:
             conn.close()
+
+
+# =========================================================
+# 12. HISTORICAL MATERIAL TRANSACTION SEARCH
+# =========================================================
+
+@app.route(
+    route="erp-material-transaction-search",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
+
+    item_number = (req.params.get("item_number") or "").strip()
+    transaction_type = (req.params.get("transaction_type") or "").strip()
+    start_date = (req.params.get("start_date") or "").strip()
+    end_date = (req.params.get("end_date") or "").strip()
+
+    after_trans_date = (req.params.get("after_trans_date") or "").strip()
+    after_trans_num = (req.params.get("after_trans_num") or "").strip()
+
+    # -----------------------------------------------------
+    # VALIDATE REQUIRED ITEM NUMBER
+    # -----------------------------------------------------
+
+    if not item_number:
+        return func.HttpResponse(
+            json.dumps({"error": "An exact item_number is required."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(item_number) > 30:
+        return func.HttpResponse(
+            json.dumps({"error": "Item number cannot exceed 30 characters."}),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if transaction_type and len(transaction_type) != 1:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "transaction_type must be a single character."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE PAGE SIZE
+    # -----------------------------------------------------
+
+    try:
+        page_size = int(req.params.get("page_size", "100"))
+
+        if page_size < 1 or page_size > 100:
+            raise ValueError()
+
+    except (ValueError, TypeError):
+        return func.HttpResponse(
+            json.dumps({
+                "error": "page_size must be an integer between 1 and 100."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE DATE FILTERS
+    # Dates use YYYY-MM-DD.
+    # End date is inclusive.
+    # -----------------------------------------------------
+
+    start_datetime = None
+    end_datetime_exclusive = None
+
+    try:
+        if start_date:
+            start_datetime = datetime.strptime(
+                start_date, "%Y-%m-%d"
+            )
+
+        if end_date:
+            end_datetime_exclusive = (
+                datetime.strptime(end_date, "%Y-%m-%d")
+                + timedelta(days=1)
+            )
+
+        if (
+            start_date
+            and end_date
+            and start_date > end_date
+        ):
+            raise ValueError("Start date cannot be after end date.")
+
+    except ValueError as e:
+        return func.HttpResponse(
+            json.dumps({
+                "error": str(e) if "cannot be after" in str(e)
+                else "Dates must use YYYY-MM-DD format."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE PAGINATION CURSOR
+    # Both cursor values must be supplied together.
+    # -----------------------------------------------------
+
+    cursor_datetime = None
+    cursor_transaction_number = None
+
+    if bool(after_trans_date) != bool(after_trans_num):
+        return func.HttpResponse(
+            json.dumps({
+                "error": (
+                    "after_trans_date and after_trans_num "
+                    "must be supplied together."
+                )
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if after_trans_date and after_trans_num:
+        try:
+            cursor_datetime = datetime.fromisoformat(
+                after_trans_date
+            )
+            cursor_transaction_number = int(after_trans_num)
+
+        except (ValueError, TypeError):
+            return func.HttpResponse(
+                json.dumps({
+                    "error": (
+                        "Invalid pagination cursor. Provide a valid "
+                        "ISO transaction date and integer transaction number."
+                    )
+                }),
+                mimetype="application/json",
+                status_code=400
+            )
+
+    # -----------------------------------------------------
+    # SQL CONNECTION
+    # -----------------------------------------------------
+
+    server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+    database = "HARLAN_APP_0709"
+
+    conn = None
+    cursor = None
+
+    try:
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        # -------------------------------------------------
+        # BUILD PARAMETERIZED QUERY FILTERS
+        # -------------------------------------------------
+
+        where_conditions = [
+            "mt.item = %(item_number)s",
+            "mt.trans_date < '2026-01-01'"
+        ]
+
+        parameters = {
+            "item_number": item_number,
+            "fetch_count": page_size + 1
+        }
+
+        if transaction_type:
+            where_conditions.append(
+                "mt.trans_type = %(transaction_type)s"
+            )
+            parameters["transaction_type"] = transaction_type
+
+        if start_datetime:
+            where_conditions.append(
+                "mt.trans_date >= %(start_date)s"
+            )
+            parameters["start_date"] = start_datetime
+
+        if end_datetime_exclusive:
+            where_conditions.append(
+                "mt.trans_date < %(end_date)s"
+            )
+            parameters["end_date"] = end_datetime_exclusive
+
+        if cursor_datetime is not None:
+            where_conditions.append("""
+                (
+                    mt.trans_date > %(after_trans_date)s
+                    OR (
+                        mt.trans_date = %(after_trans_date)s
+                        AND mt.trans_num > %(after_trans_num)s
+                    )
+                )
+            """)
+
+            parameters["after_trans_date"] = cursor_datetime
+            parameters["after_trans_num"] = cursor_transaction_number
+
+        where_clause = " AND ".join(where_conditions)
+
+        # -------------------------------------------------
+        # QUERY MATERIAL TRANSACTIONS
+        # Fetch one extra row to determine whether another
+        # page is available.
+        # -------------------------------------------------
+
+        sql_query = f"""
+            SELECT TOP (%(fetch_count)s)
+                mt.trans_num AS TransactionNumber,
+                mt.trans_date AS TransactionDate,
+                mt.trans_type AS TransactionType,
+                mt.item AS Item,
+                i.description AS ItemDescription,
+                mt.whse AS Warehouse,
+                mt.loc AS Location,
+                mt.qty AS Quantity,
+                mt.cost AS UnitCost,
+                mt.matl_cost AS MaterialCost,
+                mt.lbr_cost AS LaborCost,
+                mt.fovhd_cost AS FixedOverheadCost,
+                mt.vovhd_cost AS VariableOverheadCost,
+                mt.out_cost AS OutsideCost,
+                mt.ref_type AS ReferenceType,
+                mt.ref_num AS ReferenceNumber,
+                mt.ref_line_suf AS ReferenceLine,
+                mt.ref_release AS ReferenceRelease,
+                mt.lot AS Lot,
+                mt.reason_code AS ReasonCode,
+                mt.user_code AS UserCode,
+                mt.wc AS WorkCenter,
+                mt.document_num AS DocumentNumber,
+                mt.backflush AS Backflush
+            FROM dbo.matltran mt
+            LEFT JOIN dbo.item i
+                ON i.item = mt.item
+            WHERE {where_clause}
+            ORDER BY
+                mt.trans_date,
+                mt.trans_num
+        """
+
+        cursor.execute(sql_query, parameters)
+
+        rows = cursor.fetchall()
+
+        has_more = len(rows) > page_size
+        returned_rows = rows[:page_size]
+
+        # -------------------------------------------------
+        # FORMAT RESPONSE RECORDS
+        # -------------------------------------------------
+
+        transactions = [
+            {
+                "transaction_number": str(row[0]) if row[0] is not None else None,
+                "transaction_date": row[1],
+                "transaction_type": row[2].strip() if row[2] else None,
+                "item_number": row[3].strip() if row[3] else None,
+                "item_description": row[4],
+                "warehouse": row[5].strip() if row[5] else None,
+                "location": row[6].strip() if row[6] else None,
+                "quantity": row[7],
+                "unit_cost": row[8],
+                "material_cost": row[9],
+                "labor_cost": row[10],
+                "fixed_overhead_cost": row[11],
+                "variable_overhead_cost": row[12],
+                "outside_cost": row[13],
+                "reference_type": row[14].strip() if row[14] else None,
+                "reference_number": row[15].strip() if row[15] else None,
+                "reference_line": row[16],
+                "reference_release": row[17],
+                "lot": row[18].strip() if row[18] else None,
+                "reason_code": row[19].strip() if row[19] else None,
+                "user_code": row[20].strip() if row[20] else None,
+                "work_center": row[21].strip() if row[21] else None,
+                "document_number": row[22].strip() if row[22] else None,
+                "backflush": row[23]
+            }
+            for row in returned_rows
+        ]
+
+        # -------------------------------------------------
+        # BUILD NEXT-PAGE CURSOR
+        # -------------------------------------------------
+
+        next_cursor = None
+
+        if has_more and returned_rows:
+            last_row = returned_rows[-1]
+
+            next_cursor = {
+                "after_trans_date": last_row[1].isoformat(
+                    sep=" ", timespec="milliseconds"
+                ),
+                "after_trans_num": str(last_row[0])
+            }
+
+        # -------------------------------------------------
+        # RETURN RESULTS
+        # -------------------------------------------------
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Material Transaction Search",
+            "data_status": "Historical static snapshot",
+            "historical_cutoff": "2025-12-31",
+            "source_table": "dbo.matltran",
+            "item_number": item_number,
+            "item_description": (
+                returned_rows[0][4] if returned_rows else None
+            ),
+            "filters": {
+                "transaction_type": transaction_type or None,
+                "start_date": start_date or None,
+                "end_date": end_date or None
+            },
+            "returned_rows": len(transactions),
+            "page_size": page_size,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+            "transactions": transactions
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.exception(
+            "Historical material transaction search failed."
+        )
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Material Transaction Search",
+                "error": str(e)
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
