@@ -2855,3 +2855,386 @@ def erp_material_transaction_search(req: func.HttpRequest) -> func.HttpResponse:
 
         if conn:
             conn.close()
+
+
+# =========================================================
+# 13. HISTORICAL MATERIAL TRANSACTION CSV EXPORT
+#
+# Exports all historical material transactions for one
+# exact item number, with optional transaction type
+# and date filters.
+#
+# Historical cutoff: 2025-12-31.
+# Uses managed identity and private Blob Storage.
+# Download link expires after 15 minutes.
+# =========================================================
+
+@app.route(
+    route="erp-material-transaction-export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS
+)
+@require_erp_access
+def erp_material_transaction_export(req: func.HttpRequest) -> func.HttpResponse:
+
+    item_number = (req.params.get("item_number") or "").strip()
+    transaction_type = (req.params.get("transaction_type") or "").strip().upper()
+    start_date = (req.params.get("start_date") or "").strip()
+    end_date = (req.params.get("end_date") or "").strip()
+
+    # -----------------------------------------------------
+    # VALIDATE REQUIRED ITEM NUMBER
+    # -----------------------------------------------------
+
+    if not item_number:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "An exact item_number is required. Exporting all items is not permitted."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    if len(item_number) > 30:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Item number cannot exceed 30 characters."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE TRANSACTION TYPE
+    # -----------------------------------------------------
+
+    if transaction_type and len(transaction_type) != 1:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "transaction_type must be a single character."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE DATE FILTERS
+    # Dates use YYYY-MM-DD.
+    # End date is inclusive.
+    # -----------------------------------------------------
+
+    start_datetime = None
+    end_datetime_exclusive = None
+
+    try:
+        if start_date:
+            start_datetime = datetime.strptime(
+                start_date, "%Y-%m-%d"
+            )
+
+        if end_date:
+            end_datetime_exclusive = (
+                datetime.strptime(end_date, "%Y-%m-%d")
+                + timedelta(days=1)
+            )
+
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("Start date cannot be after end date.")
+
+    except ValueError as e:
+        return func.HttpResponse(
+            json.dumps({
+                "error": str(e) if "cannot be after" in str(e)
+                else "Dates must use YYYY-MM-DD format."
+            }),
+            mimetype="application/json",
+            status_code=400
+        )
+
+    # -----------------------------------------------------
+    # VALIDATE BLOB STORAGE CONFIGURATION
+    # -----------------------------------------------------
+
+    storage_account = os.environ.get("ERP_EXPORT_STORAGE_ACCOUNT")
+    container_name = os.environ.get("ERP_EXPORT_CONTAINER")
+
+    if not storage_account or not container_name:
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Export storage configuration is missing."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    conn = None
+    cursor = None
+
+    try:
+        # -------------------------------------------------
+        # CONNECT TO HISTORICAL SYTELINE DATABASE
+        # -------------------------------------------------
+
+        server = "sytelinedb-man-intance.054b4836a25e.database.windows.net"
+        database = "HARLAN_APP_0709"
+
+        connection_string = (
+            f"Server={server},1433;"
+            f"Database={database};"
+            "Authentication=ActiveDirectoryMSI;"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+        )
+
+        conn = mssql_python.connect(connection_string)
+        cursor = conn.cursor()
+
+        # -------------------------------------------------
+        # BUILD PARAMETERIZED FILTERS
+        # -------------------------------------------------
+
+        conditions = [
+            "mt.item = %(item_number)s",
+            "mt.trans_date < '2026-01-01'"
+        ]
+
+        parameters = {
+            "item_number": item_number
+        }
+
+        if transaction_type:
+            conditions.append(
+                "mt.trans_type = %(transaction_type)s"
+            )
+            parameters["transaction_type"] = transaction_type
+
+        if start_datetime:
+            conditions.append(
+                "mt.trans_date >= %(start_date)s"
+            )
+            parameters["start_date"] = start_datetime
+
+        if end_datetime_exclusive:
+            conditions.append(
+                "mt.trans_date < %(end_date)s"
+            )
+            parameters["end_date"] = end_datetime_exclusive
+
+        where_clause = " AND ".join(conditions)
+
+        # -------------------------------------------------
+        # QUERY ALL MATCHING MATERIAL TRANSACTIONS
+        #
+        # No TOP limit or pagination.
+        # Every matching historical transaction is exported.
+        # Zero and negative quantities are preserved.
+        # -------------------------------------------------
+
+        sql_query = f"""
+            SELECT
+                mt.trans_num AS TransactionNumber,
+                mt.trans_date AS TransactionDate,
+                mt.trans_type AS TransactionType,
+                mt.item AS Item,
+                i.description AS ItemDescription,
+                mt.whse AS Warehouse,
+                mt.loc AS Location,
+                mt.qty AS Quantity,
+                mt.cost AS UnitCost,
+                mt.matl_cost AS MaterialCost,
+                mt.lbr_cost AS LaborCost,
+                mt.fovhd_cost AS FixedOverheadCost,
+                mt.vovhd_cost AS VariableOverheadCost,
+                mt.out_cost AS OutsideCost,
+                mt.ref_type AS ReferenceType,
+                mt.ref_num AS ReferenceNumber,
+                mt.ref_line_suf AS ReferenceLine,
+                mt.ref_release AS ReferenceRelease,
+                mt.lot AS Lot,
+                mt.reason_code AS ReasonCode,
+                mt.user_code AS UserCode,
+                mt.wc AS WorkCenter,
+                mt.document_num AS DocumentNumber,
+                mt.backflush AS Backflush
+            FROM dbo.matltran mt
+            LEFT JOIN dbo.item i
+                ON i.item = mt.item
+            WHERE {where_clause}
+            ORDER BY
+                mt.trans_date,
+                mt.trans_num
+        """
+
+        cursor.execute(sql_query, parameters)
+        rows = cursor.fetchall()
+
+        # -------------------------------------------------
+        # GENERATE CSV
+        # -------------------------------------------------
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Transaction Number",
+            "Transaction Date",
+            "Transaction Type",
+            "Item Number",
+            "Item Description",
+            "Warehouse",
+            "Location",
+            "Quantity",
+            "Unit Cost",
+            "Material Cost",
+            "Labor Cost",
+            "Fixed Overhead Cost",
+            "Variable Overhead Cost",
+            "Outside Cost",
+            "Reference Type",
+            "Reference Number",
+            "Reference Line",
+            "Reference Release",
+            "Lot",
+            "Reason Code",
+            "User Code",
+            "Work Center",
+            "Document Number",
+            "Backflush"
+        ])
+
+        for row in rows:
+            writer.writerow([
+                str(value).strip() if isinstance(value, str) else value
+                for value in row
+            ])
+
+        csv_content = output.getvalue().encode("utf-8-sig")
+        output.close()
+
+        # -------------------------------------------------
+        # UPLOAD CSV USING FUNCTION APP MANAGED IDENTITY
+        # -------------------------------------------------
+
+        credential = DefaultAzureCredential()
+
+        account_url = (
+            f"https://{storage_account}.blob.core.windows.net"
+        )
+
+        blob_service = BlobServiceClient(
+            account_url=account_url,
+            credential=credential
+        )
+
+        timestamp = datetime.now(timezone.utc).strftime(
+            "%Y%m%d-%H%M%S"
+        )
+
+        unique_id = uuid.uuid4().hex[:8]
+
+        # Do not put raw user-supplied item numbers into
+        # the Blob path.
+        blob_name = (
+            f"material-transactions/"
+            f"material-transactions-{timestamp}-{unique_id}.csv"
+        )
+
+        blob_client = blob_service.get_blob_client(
+            container=container_name,
+            blob=blob_name
+        )
+
+        blob_client.upload_blob(
+            csv_content,
+            overwrite=False,
+            content_settings=ContentSettings(
+                content_type="text/csv; charset=utf-8"
+            )
+        )
+
+        # -------------------------------------------------
+        # GENERATE TEMPORARY USER-DELEGATION SAS URL
+        # -------------------------------------------------
+
+        now = datetime.now(timezone.utc)
+        starts_on = now - timedelta(minutes=5)
+        expires_on = now + timedelta(minutes=15)
+
+        delegation_key = blob_service.get_user_delegation_key(
+            key_start_time=starts_on,
+            key_expiry_time=expires_on
+        )
+
+        sas_token = generate_blob_sas(
+            account_name=storage_account,
+            container_name=container_name,
+            blob_name=blob_name,
+            user_delegation_key=delegation_key,
+            permission=BlobSasPermissions(read=True),
+            start=starts_on,
+            expiry=expires_on
+        )
+
+        download_url = f"{blob_client.url}?{sas_token}"
+
+        # -------------------------------------------------
+        # RETURN EXPORT DETAILS
+        # -------------------------------------------------
+
+        result = {
+            "connection": "Success",
+            "report": "Historical Material Transaction CSV Export",
+            "data_status": "Historical static snapshot",
+            "historical_cutoff": "2025-12-31",
+            "source_table": "dbo.matltran",
+            "item_number": item_number,
+            "item_description": (
+                str(rows[0][4]).strip()
+                if rows and rows[0][4] else None
+            ),
+            "filters": {
+                "transaction_type": transaction_type or None,
+                "start_date": start_date or None,
+                "end_date": end_date or None
+            },
+            "exported_rows": len(rows),
+            "file_name": blob_name.split("/")[-1],
+            "container": container_name,
+            "download_url": download_url,
+            "link_expires_utc": expires_on.isoformat(),
+            "message": (
+                "Historical material transaction CSV export "
+                "created successfully."
+            )
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, default=str, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception:
+        logging.exception(
+            "Historical material transaction CSV export failed."
+        )
+
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "report": "Historical Material Transaction CSV Export",
+                "error": (
+                    "Material transaction export failed. "
+                    "Check Function App logs."
+                )
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
