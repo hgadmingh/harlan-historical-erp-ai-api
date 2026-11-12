@@ -1140,16 +1140,16 @@ def erp_purchase_order_export(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200
         )
 
-        except Exception:
-            logging.exception("Purchase Order CSV export failed")
-            return func.HttpResponse(
-                json.dumps({
-                    "connection": "Failed",
-                    "error": "Purchase order export failed. Check Function App logs."
-                }),
-                mimetype="application/json",
-                status_code=500
-            )
+    except Exception:
+        logging.exception("Purchase Order CSV export failed")
+        return func.HttpResponse(
+            json.dumps({
+                "connection": "Failed",
+                "error": "Purchase order export failed. Check Function App logs."
+            }),
+            mimetype="application/json",
+            status_code=500
+        )
 
     finally:
         if cursor:
